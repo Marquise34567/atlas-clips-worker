@@ -19,8 +19,11 @@ The app runs on port 7860 (HF Spaces default).
 
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -642,3 +645,370 @@ async def pipeline(req: PipelineReq):
         return result
     except Exception as e:
         return JSONResponse({"error": "pipeline_failed", "details": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# SQLite Job Store
+# ---------------------------------------------------------------------------
+
+DB_PATH = "/tmp/atlas_clips.db"
+
+_JOB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY,
+  source_url TEXT,
+  status TEXT DEFAULT 'pending',
+  progress INTEGER DEFAULT 0,
+  clip_count INTEGER DEFAULT 0,
+  clips_json TEXT,
+  analysis_json TEXT,
+  error TEXT,
+  created_at REAL,
+  updated_at REAL
+);
+"""
+
+
+class JobStore:
+    """Lightweight SQLite-backed job store."""
+
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _conn(self):
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        with self._lock:
+            conn = self._conn()
+            try:
+                conn.executescript(_JOB_SCHEMA)
+                conn.commit()
+            finally:
+                conn.close()
+
+    def create(self, job_id: str, source_url: str = "") -> Dict[str, Any]:
+        now = time.time()
+        with self._lock:
+            conn = self._conn()
+            try:
+                conn.execute(
+                    "INSERT INTO jobs (id, source_url, status, progress, clip_count, created_at, updated_at) "
+                    "VALUES (?, ?, 'pending', 0, 0, ?, ?)",
+                    (job_id, source_url, now, now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return self.get(job_id)
+
+    def get(self, job_id: str) -> Optional[Dict[str, Any]]:
+        conn = self._conn()
+        try:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return self._row_to_dict(row) if row else None
+        finally:
+            conn.close()
+
+    def update(self, job_id: str, **fields) -> Optional[Dict[str, Any]]:
+        if not fields:
+            return self.get(job_id)
+        fields["updated_at"] = time.time()
+        set_clause = ", ".join(f"{k} = ?" for k in fields.keys())
+        values = list(fields.values()) + [job_id]
+        with self._lock:
+            conn = self._conn()
+            try:
+                conn.execute(f"UPDATE jobs SET {set_clause} WHERE id = ?", values)
+                conn.commit()
+            finally:
+                conn.close()
+        return self.get(job_id)
+
+    def list(self) -> List[Dict[str, Any]]:
+        conn = self._conn()
+        try:
+            rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
+            return [self._row_to_dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def delete(self, job_id: str) -> bool:
+        with self._lock:
+            conn = self._conn()
+            try:
+                cur = conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+
+    @staticmethod
+    def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+        d = dict(row)
+        for key in ("clips_json", "analysis_json"):
+            if d.get(key):
+                try:
+                    d[key.replace("_json", "")] = json.loads(d[key])
+                except (json.JSONDecodeError, TypeError):
+                    d[key.replace("_json", "")] = None
+            else:
+                d[key.replace("_json", "")] = None
+            d.pop(key, None)
+        return d
+
+
+job_store = JobStore()
+
+
+# ---------------------------------------------------------------------------
+# Job request models
+# ---------------------------------------------------------------------------
+
+class CreateJobReq(BaseModel):
+    sourceUrl: str
+    transcript: str = ""
+    reframeConfig: Optional[Dict] = None
+    fastMode: bool = False
+    maxClips: int = 10
+
+class ReframeClipReq(BaseModel):
+    clipIndex: int
+    reframeConfig: Optional[Dict] = None
+
+class ManualClipReq(BaseModel):
+    startTime: float
+    endTime: float
+    title: Optional[str] = None
+    reframeConfig: Optional[Dict] = None
+
+class ReframeBatchReq(BaseModel):
+    clipIndices: List[int]
+    reframeConfig: Optional[Dict] = None
+
+
+# ---------------------------------------------------------------------------
+# Background processing
+# ---------------------------------------------------------------------------
+
+def _run_pipeline_background(job_id: str, source_url: str, transcript: str, reframe_config: Optional[Dict], fast_mode: bool, max_clips: int):
+    """Run the full pipeline in a background thread, updating the job store."""
+    try:
+        job_store.update(job_id, status="analyzing", progress=10)
+        moments = detect_moments(
+            transcript=transcript,
+            source_type=_detect_source_type(source_url),
+            reframe_config=reframe_config,
+            fast_mode=fast_mode,
+        )
+        clips = moments.get("clips", [])[:max_clips]
+        job_store.update(
+            job_id,
+            status="downloading",
+            progress=25,
+            analysis_json=json.dumps(moments),
+        )
+
+        download_result = download_source(url=source_url, job_id=job_id)
+        video_path = download_result["videoPath"]
+
+        job_store.update(job_id, status="processing", progress=50)
+
+        rc = reframe_config or {}
+        processed = process_batch(
+            video_path=video_path,
+            clips=clips,
+            has_webcam=rc.get("webcamPipFirst", True),
+            webcam_position=rc.get("webcamPosition", "top"),
+            background_position=rc.get("backgroundPosition", "bottom"),
+            enable_captions=rc.get("enableCaptions", False),
+            job_id=job_id,
+        )
+
+        job_store.update(
+            job_id,
+            status="completed",
+            progress=100,
+            clip_count=len(processed),
+            clips_json=json.dumps(processed),
+        )
+    except Exception as e:
+        job_store.update(job_id, status="failed", error=str(e), progress=0)
+
+
+def _run_single_clip_background(
+    job_id: str,
+    source_url: str,
+    start_time: float,
+    end_time: float,
+    clip_title: str,
+    reframe_config: Optional[Dict],
+):
+    """Download source, cut a single clip, reframe, upload to R2."""
+    try:
+        job_store.update(job_id, status="downloading", progress=20)
+        download_result = download_source(url=source_url, job_id=job_id)
+        video_path = download_result["videoPath"]
+
+        job_store.update(job_id, status="processing", progress=50)
+        rc = reframe_config or {}
+        result = process_single_clip(
+            video_path=video_path,
+            start_time=start_time,
+            end_time=end_time,
+            clip_title=clip_title,
+            has_webcam=rc.get("webcamPipFirst", True),
+            webcam_position=rc.get("webcamPosition", "top"),
+            background_position=rc.get("backgroundPosition", "bottom"),
+            enable_captions=rc.get("enableCaptions", False),
+            job_id=job_id,
+        )
+
+        job_store.update(
+            job_id,
+            status="completed",
+            progress=100,
+            clip_count=1,
+            clips_json=json.dumps([result]),
+        )
+    except Exception as e:
+        job_store.update(job_id, status="failed", error=str(e), progress=0)
+
+
+# ---------------------------------------------------------------------------
+# Job management endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/atlas-clips/jobs")
+async def create_job(req: CreateJobReq):
+    job_id = str(uuid.uuid4())[:12]
+    job_store.create(job_id, source_url=req.sourceUrl)
+    thread = threading.Thread(
+        target=_run_pipeline_background,
+        args=(job_id, req.sourceUrl, req.transcript, req.reframeConfig, req.fastMode, req.maxClips),
+        daemon=True,
+    )
+    thread.start()
+    return {"id": job_id, "status": "pending"}
+
+
+@app.get("/api/atlas-clips/jobs/{job_id}")
+async def get_job(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        return JSONResponse({"error": "job_not_found"}, status_code=404)
+    return {
+        "id": job["id"],
+        "status": job.get("status"),
+        "progress": job.get("progress", 0),
+        "clipCount": job.get("clip_count", 0),
+        "clips": job.get("clips"),
+        "analysis": job.get("analysis"),
+        "error": job.get("error"),
+    }
+
+
+@app.get("/api/atlas-clips/jobs")
+async def list_jobs():
+    jobs = job_store.list()
+    return {"jobs": jobs}
+
+
+@app.delete("/api/atlas-clips/jobs/{job_id}")
+async def delete_job(job_id: str):
+    deleted = job_store.delete(job_id)
+    if not deleted:
+        return JSONResponse({"error": "job_not_found"}, status_code=404)
+    return {"id": job_id, "deleted": True}
+
+
+@app.post("/api/atlas-clips/jobs/{job_id}/reframe")
+async def reframe_clip(job_id: str, req: ReframeClipReq):
+    parent = job_store.get(job_id)
+    if not parent:
+        return JSONResponse({"error": "job_not_found"}, status_code=404)
+    analysis = parent.get("analysis") or {}
+    clips = analysis.get("clips", [])
+    if req.clipIndex < 0 or req.clipIndex >= len(clips):
+        return JSONResponse({"error": "clip_index_out_of_range"}, status_code=400)
+    clip = clips[req.clipIndex]
+
+    new_job_id = str(uuid.uuid4())[:12]
+    job_store.create(new_job_id, source_url=parent.get("source_url", ""))
+    thread = threading.Thread(
+        target=_run_single_clip_background,
+        args=(
+            new_job_id,
+            parent.get("source_url", ""),
+            clip.get("startTime", 0),
+            clip.get("endTime", 0),
+            clip.get("title", f"Clip {req.clipIndex + 1}"),
+            req.reframeConfig,
+        ),
+        daemon=True,
+    )
+    thread.start()
+    return {"id": new_job_id, "status": "pending"}
+
+
+@app.post("/api/atlas-clips/jobs/{job_id}/manual")
+async def manual_clip(job_id: str, req: ManualClipReq):
+    parent = job_store.get(job_id)
+    if not parent:
+        return JSONResponse({"error": "job_not_found"}, status_code=404)
+
+    new_job_id = str(uuid.uuid4())[:12]
+    job_store.create(new_job_id, source_url=parent.get("source_url", ""))
+    thread = threading.Thread(
+        target=_run_single_clip_background,
+        args=(
+            new_job_id,
+            parent.get("source_url", ""),
+            req.startTime,
+            req.endTime,
+            req.title or "Manual Clip",
+            req.reframeConfig,
+        ),
+        daemon=True,
+    )
+    thread.start()
+    return {"id": new_job_id, "status": "pending"}
+
+
+@app.post("/api/atlas-clips/jobs/{job_id}/reframe-batch")
+async def reframe_batch(job_id: str, req: ReframeBatchReq):
+    parent = job_store.get(job_id)
+    if not parent:
+        return JSONResponse({"error": "job_not_found"}, status_code=404)
+    analysis = parent.get("analysis") or {}
+    clips = analysis.get("clips", [])
+
+    created = []
+    threads = []
+    for idx in req.clipIndices:
+        if idx < 0 or idx >= len(clips):
+            continue
+        clip = clips[idx]
+        new_job_id = str(uuid.uuid4())[:12]
+        job_store.create(new_job_id, source_url=parent.get("source_url", ""))
+        t = threading.Thread(
+            target=_run_single_clip_background,
+            args=(
+                new_job_id,
+                parent.get("source_url", ""),
+                clip.get("startTime", 0),
+                clip.get("endTime", 0),
+                clip.get("title", f"Clip {idx + 1}"),
+                req.reframeConfig,
+            ),
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        created.append({"id": new_job_id, "status": "pending", "clipIndex": idx})
+
+    return {"jobs": created}
