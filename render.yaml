@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: atlas-clips
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        value: autoeditor
+      - key: MAX_WORKERS
+        value: "2"
+      - key: CORS_ORIGINS
+        value: "https://www.autoeditor.app,https://autoeditor.app"
