@@ -838,9 +838,8 @@ def download_clip_segment(
 ) -> Dict[str, Any]:
     """Download ONLY the clip segment (start_time → end_time) from the source.
 
-    Uses yt-dlp to get the direct stream URL, then ffmpeg to seek and
-    download just the clip portion. This avoids downloading the full VOD
-    — a 30s clip from a 3-hour VOD downloads ~30s of video.
+    Uses yt-dlp with --download-sections + 5 concurrent fragment downloads
+    for ~5x speedup over the old yt-dlp-URL + ffmpeg-seek approach.
     """
     source_type = _detect_source_type(url)
     if not source_type:
@@ -851,67 +850,45 @@ def download_clip_segment(
     output_path = str(cache_dir / "clip_source.mp4")
 
     # Pad the download range by 5s on each side for clean cuts
-    pad = 5.0
+    pad = 3.0
     dl_start = max(0.0, start_time - pad)
     dl_end = end_time + pad
     duration = max(0.1, dl_end - dl_start)
 
-    # Step 1: Get the direct stream URL with yt-dlp
+    # Use yt-dlp to download ONLY the needed section with 5 concurrent
+    # fragment downloads. This is much faster than the old approach
+    # (yt-dlp -g -> ffmpeg single-connection) because:
+    #   1. yt-dlp downloads HLS/DASH fragments in parallel (5x throughput)
+    #   2. --download-sections skips fragments outside the time range
+    #   3. No separate yt-dlp + ffmpeg round-trip
     ytdlp_cmd = [
         "yt-dlp",
-        "-g",
         "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best",
         "--no-playlist",
         "--retries", "3",
+        "--concurrent-fragments", "5",
+        "--throttled-request-rate", "10",
+        "--download-sections", f"*{dl_start}-{dl_end}",
+        "--force-keyframes-at-cuts",
+        "-o", output_path,
+        "--merge-output-format", "mp4",
         "--extractor-args", "youtube:player_client=android,ios,web_safari,web",
         "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         url,
     ]
-    ytdlp_result = subprocess.run(ytdlp_cmd, capture_output=True, text=True, timeout=120)
+    ytdlp_result = subprocess.run(ytdlp_cmd, capture_output=True, text=True, timeout=180)
     if ytdlp_result.returncode != 0:
-        raise RuntimeError(f"yt-dlp URL fetch failed: {ytdlp_result.stderr[-2000:]}")
-
-    stream_urls = [u.strip() for u in ytdlp_result.stdout.strip().split("\n") if u.strip()]
-    if not stream_urls:
-        raise RuntimeError("yt-dlp returned no stream URLs")
-
-    # Step 2: Use ffmpeg to download only the clip segment via seek
-    # -ss before -i seeks in the stream (fast seek for HLS)
-    # For HLS streams, ffmpeg reads only the segments needed for the seek range
-    # Use -c copy to avoid re-encoding during download (re-encoding happens
-    # later in process_single_clip during reframe)
-    if len(stream_urls) >= 2:
-        # Separate video and audio URLs
-        video_url, audio_url = stream_urls[0], stream_urls[1]
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(dl_start),
-            "-i", video_url,
-            "-ss", "0",
-            "-i", audio_url,
-            "-t", str(duration),
-            "-c", "copy",
-            "-movflags", "+faststart",
-            output_path,
-        ]
-    else:
-        # Single URL (muxed stream)
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(dl_start),
-            "-i", stream_urls[0],
-            "-t", str(duration),
-            "-c", "copy",
-            "-movflags", "+faststart",
-            output_path,
-        ]
-
-    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg segment download failed: {result.stderr[-3000:]}")
+        # Fallback to the old approach if yt-dlp download-sections fails
+        print(f"yt-dlp download-sections failed, falling back to ffmpeg seek: {ytdlp_result.stderr[-2000:]}")
+        return _download_clip_segment_ffmpeg(url, job_id, dl_start, duration, output_path)
 
     if not os.path.exists(output_path):
-        raise RuntimeError("ffmpeg completed but no output file found")
+        # yt-dlp may have saved with a different extension - find it
+        candidates = list(cache_dir.glob("clip_source.*"))
+        if candidates:
+            os.rename(str(candidates[0]), output_path)
+        else:
+            raise RuntimeError("yt-dlp completed but no output file found")
 
     # Probe the downloaded segment duration
     probe = subprocess.run(
