@@ -263,10 +263,12 @@ def download_source(url: str, job_id: str) -> Dict[str, Any]:
 
     cmd = [
         "yt-dlp",
-        "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best",
         "--merge-output-format", "mp4",
         "-o", output_template,
         "--no-playlist",
+        "--retries", "3",
+        "--fragment-retries", "3",
         url,
     ]
 
@@ -316,12 +318,15 @@ def download_audio_only(url: str, job_id: str) -> Dict[str, Any]:
 
     cmd = [
         "yt-dlp",
-        "-f", "bestaudio/best",
+        "-f", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[ext=mp4]/best",
         "--extract-audio",
         "--audio-format", "wav",
+        "--audio-quality", "0",
         "-o", output_template,
         "--no-playlist",
         "--no-warnings",
+        "--retries", "3",
+        "--fragment-retries", "3",
         url,
     ]
 
