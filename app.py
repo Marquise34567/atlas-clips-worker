@@ -1233,8 +1233,8 @@ def _build_reframe_filter(
       - Captions: burned into the bottom third of the frame
     """
 
-    W, H = 1080, 1920
-    half_h = H // 2  # 960
+    W, H = 720, 1280
+    half_h = H // 2  # 640
 
     if has_webcam:
         filters = [
@@ -1255,15 +1255,15 @@ def _build_reframe_filter(
         ]
 
     # Burn captions if enabled and SRT file exists
-    if enable_captions and srt_path:
+    if enable_captions and srt_path and os.path.exists(srt_path):
         # Escape the path for ffmpeg filter (colons and backslashes need escaping)
         esc_path = srt_path.replace("\\", "/").replace(":", "\\:")
         # Use subtitles filter to burn captions at the bottom of the frame
-        # Force original aspect ratio off, and style with white text + black outline
+        # Style: white text + black outline, positioned at the bottom
         filters.append(
-            f"[stacked]subtitles='{esc_path}':force_style='FontName=Arial,FontSize=24,"
+            f"[stacked]subtitles='{esc_path}':force_style='FontName=Arial,FontSize=18,"
             f"PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,"
-            f"Outline=2,Shadow=1,MarginV=80,Alignment=2'[out]"
+            f"Outline=2,Shadow=1,MarginV=60,Alignment=2'[out]"
         )
     else:
         filters.append("[stacked]null[out]")
@@ -1382,8 +1382,8 @@ def process_single_clip(
         "-filter_complex", filter_str,
         "-map", "[out]",
         "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
+        "-preset", "ultrafast",
+        "-crf", "28",
         "-pix_fmt", "yuv420p",
         "-r", "30",
         "-c:a", "aac",
@@ -1392,7 +1392,7 @@ def process_single_clip(
         output_path,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=540)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {result.stderr[-3000:]}")
 
