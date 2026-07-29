@@ -2748,6 +2748,121 @@ def _run_pipeline_background(job_id: str, source_url: str, transcript: str, refr
             if moments.get("topRecommendation") and clips:
                 moments["topRecommendation"]["title"] = clips[0].get("title", "")
 
+        # Save analysis results (with segments for caption lookup later)
+        job_store.update(
+            job_id,
+            status="analyzing",
+            progress=90,
+            clip_count=len(clips),
+            analysis_json=json.dumps(moments),
+            segments_json=json.dumps(segments),
+        )
+
+        # ── AUTO-REFRAME: download + reframe + upload all clips ────────────
+        # Instead of stopping at timestamps, we now produce finished videos.
+        # Each clip is downloaded as a segment, reframed to 9:16 with captions
+        # burned in, and uploaded to R2 — all in parallel.
+        rc = reframe_config or {}
+        if clips and rc.get("autoReframe", True):
+            job_store.update(job_id, status="reframing", progress=92)
+            print(f"[pipeline {job_id}] Auto-reframing {len(clips)} clips...")
+
+            webcam_corner = None
+            if rc.get("autoDetectWebcam", True):
+                has_webcam = None  # auto-detect
+            else:
+                corner = rc.get("webcamCorner", "none")
+                if corner and corner != "none":
+                    has_webcam = True
+                    webcam_corner = corner
+                else:
+                    has_webcam = False
+
+            enable_captions = rc.get("enableCaptions", True)
+            caption_style = rc.get("captionStyle", "karaoke")
+
+            reframed_clips = []
+            errors = []
+
+            def _reframe_one(clip_idx: int, clip: Dict[str, Any]) -> Dict[str, Any]:
+                """Download + reframe a single clip. Returns result dict."""
+                sub_job_id = f"{job_id}_{clip_idx}"
+                start_t = clip.get("startTime", 0)
+                end_t = clip.get("endTime", 0)
+                title = clip.get("title", f"Clip {clip_idx + 1}")
+                print(f"[pipeline {job_id}] Reframing clip {clip_idx}: {title} ({start_t:.1f}-{end_t:.1f}s)")
+
+                download_result = _retry(
+                    lambda: download_clip_segment(
+                        url=source_url, job_id=sub_job_id,
+                        start_time=start_t, end_time=end_t,
+                    ),
+                    attempts=2, backoff=3.0, label=f"auto-reframe-download-{clip_idx}",
+                )
+                video_path = download_result["videoPath"]
+                segment_offset = download_result.get("segmentOffset", 0.0)
+                local_start = max(0.0, start_t - segment_offset)
+                local_end = end_t - segment_offset
+
+                try:
+                    result = process_single_clip(
+                        video_path=video_path,
+                        start_time=local_start,
+                        end_time=local_end,
+                        clip_title=title,
+                        has_webcam=has_webcam,
+                        webcam_position=rc.get("webcamPosition", "top"),
+                        background_position=rc.get("backgroundPosition", "bottom"),
+                        enable_captions=enable_captions,
+                        caption_style=caption_style,
+                        job_id=sub_job_id,
+                        transcript_segments=segments,
+                        segment_offset=segment_offset,
+                        webcam_corner=webcam_corner,
+                    )
+                    # Merge analysis data with reframe result
+                    result["startTime"] = clip.get("startTime", 0)
+                    result["endTime"] = clip.get("endTime", 0)
+                    result["viralScore"] = clip.get("viralScore", 0)
+                    result["hookScore"] = clip.get("hookScore", 0)
+                    result["pacingScore"] = clip.get("pacingScore", 0)
+                    result["payoffScore"] = clip.get("payoffScore", 0)
+                    result["category"] = clip.get("category", "")
+                    result["wordCount"] = clip.get("wordCount", 0)
+                    result["hasCompleteThought"] = clip.get("hasCompleteThought", False)
+                    return result
+                finally:
+                    try:
+                        os.unlink(video_path)
+                    except OSError:
+                        pass
+
+            with ThreadPoolExecutor(max_workers=min(3, len(clips))) as executor:
+                future_to_idx = {}
+                for i, clip in enumerate(clips):
+                    future = executor.submit(_reframe_one, i, clip)
+                    future_to_idx[future] = i
+
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        reframed_clips.append(future.result())
+                    except Exception as e:
+                        print(f"[pipeline {job_id}] Clip {idx} reframe failed: {e}")
+                        errors.append({"clipIndex": idx, "error": str(e)})
+                        # Keep the analysis-only clip as fallback
+                        reframed_clips.append(clips[idx])
+
+            # Sort by original order
+            reframed_clips.sort(key=lambda c: c.get("startTime", 0))
+            moments["clips"] = reframed_clips
+            if moments.get("topRecommendation") and reframed_clips:
+                best = reframed_clips[0]
+                moments["topRecommendation"]["publicUrl"] = best.get("publicUrl", "")
+                moments["topRecommendation"]["thumbnailUrl"] = best.get("thumbnailUrl", "")
+
+            print(f"[pipeline {job_id}] Auto-reframe complete: {len(reframed_clips)} clips, {len(errors)} errors")
+
         job_store.update(
             job_id,
             status="completed",
