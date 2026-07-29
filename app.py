@@ -1222,36 +1222,116 @@ def _detect_webcam(video_path: str) -> bool:
         return True  # Fallback: assume webcam (safe default for Twitch)
 
 
+# Caption style presets — maps a user-facing style name to ffmpeg
+# subtitles force_style parameters. Colours are in ASS hex format
+# (&HBBGGRR&, BGR byte order, NOT RGB).
+CAPTION_STYLES = {
+    "white": {
+        "FontName": "Arial",
+        "FontSize": 18,
+        "PrimaryColour": "&HFFFFFF&",   # white
+        "OutlineColour": "&H000000&",   # black
+        "BorderStyle": 3,               # opaque box
+        "Outline": 2,
+        "Shadow": 1,
+        "MarginV": 60,
+        "Alignment": 2,                 # bottom center
+    },
+    "yellow": {
+        "FontName": "Arial",
+        "FontSize": 20,
+        "PrimaryColour": "&H00FFFF&",   # yellow (BGR)
+        "OutlineColour": "&H000000&",   # black
+        "BorderStyle": 1,               # outline only
+        "Outline": 3,
+        "Shadow": 0,
+        "MarginV": 60,
+        "Alignment": 2,
+    },
+    "karaoke": {
+        "FontName": "Arial",
+        "FontSize": 22,
+        "PrimaryColour": "&HFFFFFF&",   # white
+        "OutlineColour": "&H0000FF&",   # red outline (BGR)
+        "BorderStyle": 1,
+        "Outline": 3,
+        "Shadow": 1,
+        "MarginV": 80,
+        "Alignment": 2,
+    },
+    "tiktok": {
+        "FontName": "Arial Black",
+        "FontSize": 28,
+        "PrimaryColour": "&HFFFFFF&",   # white
+        "OutlineColour": "&H000000&",   # black
+        "BorderStyle": 1,
+        "Outline": 4,
+        "Shadow": 2,
+        "MarginV": 40,
+        "Alignment": 2,                 # bottom center, large
+    },
+    "minimal": {
+        "FontName": "Arial",
+        "FontSize": 14,
+        "PrimaryColour": "&HDDDDDD&",   # light grey
+        "OutlineColour": "&H000000&",   # black
+        "BorderStyle": 1,
+        "Outline": 0,
+        "Shadow": 0,
+        "MarginV": 30,
+        "Alignment": 2,
+    },
+}
+
+
+def _caption_force_style(style_name: str) -> str:
+    """Build the force_style string for ffmpeg subtitles filter."""
+    preset = CAPTION_STYLES.get(style_name, CAPTION_STYLES["white"])
+    parts = []
+    for key, val in preset.items():
+        if isinstance(val, str) and val.startswith("&H"):
+            parts.append(f"{key}={val}")
+        else:
+            parts.append(f"{key}={val}")
+    return ",".join(parts)
+
+
 def _build_reframe_filter(
     has_webcam: bool,
     webcam_position: str = "top",
     background_position: str = "bottom",
     enable_captions: bool = False,
     srt_path: str = "",
+    caption_style: str = "white",
 ) -> str:
     """Build the ffmpeg filter_complex string for vertical 9:16 reframing.
 
-    Layout (1080x1920 vertical):
+    Layout (720x1280 vertical):
       - With webcam: top half = webcam (speaker), bottom half = gameplay
+        (or reversed if webcam_position is 'bottom')
       - Without webcam: full frame = scaled source
-      - Captions: burned into the bottom third of the frame
+      - Captions: burned into the frame using the selected style preset
     """
 
     W, H = 720, 1280
     half_h = H // 2  # 640
 
     if has_webcam:
+        # Determine stacking order based on webcam_position
+        webcam_on_top = webcam_position not in ("bottom", "bottom-left", "bottom-right")
         filters = [
             "[0:v]split=2[webcam_src][bg_src]",
-            # Webcam: top half of source → 1080x960
+            # Webcam: top half of source → 720x640
             f"[webcam_src]crop=iw:ih/2:0:0,scale={W}:{half_h}:force_original_aspect_ratio=increase,"
             f"crop={W}:{half_h}[webcam]",
-            # Gameplay: bottom half of source → 1080x960
+            # Gameplay: bottom half of source → 720x640
             f"[bg_src]crop=iw:ih/2:0:ih/2,scale={W}:{half_h}:force_original_aspect_ratio=increase,"
             f"crop={W}:{half_h}[bg]",
-            # Stack: webcam on top, gameplay on bottom
-            "[webcam][bg]vstack[stacked]",
         ]
+        if webcam_on_top:
+            filters.append("[webcam][bg]vstack[stacked]")
+        else:
+            filters.append("[bg][webcam]vstack[stacked]")
     else:
         filters = [
             f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
@@ -1262,12 +1342,9 @@ def _build_reframe_filter(
     if enable_captions and srt_path and os.path.exists(srt_path):
         # Escape the path for ffmpeg filter (colons and backslashes need escaping)
         esc_path = srt_path.replace("\\", "/").replace(":", "\\:")
-        # Use subtitles filter to burn captions at the bottom of the frame
-        # Style: white text + black outline, positioned at the bottom
+        force_style = _caption_force_style(caption_style)
         filters.append(
-            f"[stacked]subtitles='{esc_path}':force_style='FontName=Arial,FontSize=18,"
-            f"PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,"
-            f"Outline=2,Shadow=1,MarginV=60,Alignment=2'[out]"
+            f"[stacked]subtitles='{esc_path}':force_style='{force_style}'[out]"
         )
     else:
         filters.append("[stacked]null[out]")
@@ -1333,6 +1410,7 @@ def process_single_clip(
     webcam_position: str = "top",
     background_position: str = "bottom",
     enable_captions: bool = False,
+    caption_style: str = "white",
     job_id: str = "",
     transcript_segments: Optional[List[Dict[str, Any]]] = None,
     segment_offset: float = 0.0,
@@ -1340,8 +1418,10 @@ def process_single_clip(
     """Cut, reframe, and encode a single clip. Uploads to R2.
 
     If has_webcam is None, auto-detects webcam presence from the video.
-    When webcam is detected: webcam goes on TOP, gameplay goes on BOTTOM.
-    If enable_captions and transcript_segments are provided, burns captions.
+    webcam_position controls stacking order: 'top' = webcam on top,
+    'bottom' = gameplay on top, webcam on bottom.
+    If enable_captions and transcript_segments are provided, burns captions
+    using the selected caption_style preset.
     """
 
     # Auto-detect webcam if not specified
@@ -1375,6 +1455,7 @@ def process_single_clip(
         background_position=background_position,
         enable_captions=enable_captions,
         srt_path=srt_path,
+        caption_style=caption_style,
     )
 
     cmd = [
@@ -1922,9 +2003,14 @@ def _run_single_clip_background(
 
         job_store.update(job_id, status="processing", progress=50)
         rc = reframe_config or {}
-        # If user explicitly set webcamPipFirst, use it; otherwise auto-detect (None)
-        webcam_setting = rc.get("webcamPipFirst")
-        has_webcam = None if webcam_setting is None else bool(webcam_setting)
+        # Webcam handling:
+        # - autoDetectWebcam=true (default): pass None → process_single_clip
+        #   will run face detection on a sample frame.
+        # - autoDetectWebcam=false: use webcamPipFirst as a manual override.
+        if rc.get("autoDetectWebcam", True):
+            has_webcam = None  # auto-detect
+        else:
+            has_webcam = bool(rc.get("webcamPipFirst", True))
 
         # Fetch transcript segments from the parent analysis job for captions
         transcript_segments = None
@@ -1948,6 +2034,7 @@ def _run_single_clip_background(
             webcam_position=rc.get("webcamPosition", "top"),
             background_position=rc.get("backgroundPosition", "bottom"),
             enable_captions=rc.get("enableCaptions", False),
+            caption_style=rc.get("captionStyle", "white"),
             job_id=job_id,
             transcript_segments=transcript_segments,
             segment_offset=segment_offset,
