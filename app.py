@@ -1422,13 +1422,18 @@ def process_single_clip(
     except OSError:
         pass
 
-    account_id = os.environ.get("R2_ACCOUNT_ID", "").strip()
-    public_url = f"https://{account_id}.r2.cloudflarestorage.com/{bucket}/{r2_key}"
+    # Generate a presigned URL (valid for 7 days) since the R2 bucket
+    # is not publicly accessible.
+    presigned_url = r2_client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": r2_key},
+        ExpiresIn=604800,  # 7 days
+    )
 
     return {
         "clipId": clip_id,
         "r2Key": r2_key,
-        "publicUrl": public_url,
+        "publicUrl": presigned_url,
         "title": clip_title,
         "startTime": start_time,
         "endTime": end_time,
