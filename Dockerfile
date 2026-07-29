@@ -1,13 +1,13 @@
 FROM python:3.11-slim
 
-# Install ffmpeg + yt-dlp + system deps
+# Install ffmpeg + system deps (yt-dlp installed via pip for latest version)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    yt-dlp \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps
+# Install yt-dlp (latest) + Python deps
+RUN pip install --no-cache-dir -U yt-dlp
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
