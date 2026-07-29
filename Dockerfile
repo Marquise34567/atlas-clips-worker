@@ -1,10 +1,16 @@
 FROM python:3.11-slim
 
-# Install ffmpeg + system deps (yt-dlp installed via pip for latest version)
+# Install ffmpeg + system deps + fonts for caption rendering (yt-dlp via pip)
+# fonts-dejavu-core provides DejaVu Sans (Arial equivalent) for ASS subtitles
+# fonts-liberation provides Liberation Sans (another Arial equivalent)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    fonts-dejavu-core \
+    fonts-liberation \
+    fontconfig \
+    && rm -rf /var/lib/apt/lists/* \
+    && fc-cache -f
 
 # Install yt-dlp (latest) + Python deps
 RUN pip install --no-cache-dir -U yt-dlp

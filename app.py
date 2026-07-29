@@ -1627,7 +1627,7 @@ def _detect_webcam(video_path: str) -> Optional[Dict[str, Any]]:
 # (&HBBGGRR&, BGR byte order, NOT RGB).
 CAPTION_STYLES = {
     "white": {
-        "FontName": "Arial",
+        "FontName": "DejaVu Sans",
         "FontSize": 18,
         "PrimaryColour": "&HFFFFFF&",   # white
         "OutlineColour": "&H000000&",   # black
@@ -1638,7 +1638,7 @@ CAPTION_STYLES = {
         "Alignment": 2,                 # bottom center
     },
     "yellow": {
-        "FontName": "Arial",
+        "FontName": "DejaVu Sans",
         "FontSize": 20,
         "PrimaryColour": "&H00FFFF&",   # yellow (BGR)
         "OutlineColour": "&H000000&",   # black
@@ -1649,7 +1649,7 @@ CAPTION_STYLES = {
         "Alignment": 2,
     },
     "karaoke": {
-        "FontName": "Arial",
+        "FontName": "DejaVu Sans",
         "FontSize": 22,
         "PrimaryColour": "&HFFFFFF&",   # white
         "OutlineColour": "&H0000FF&",   # red outline (BGR)
@@ -1660,7 +1660,7 @@ CAPTION_STYLES = {
         "Alignment": 2,
     },
     "tiktok": {
-        "FontName": "Arial Black",
+        "FontName": "DejaVu Sans",
         "FontSize": 32,
         "PrimaryColour": "&HFFFFFF&",   # white
         "OutlineColour": "&H000000&",   # black
@@ -1671,7 +1671,7 @@ CAPTION_STYLES = {
         "Alignment": 5,                 # center-center (not bottom)
     },
     "minimal": {
-        "FontName": "Arial",
+        "FontName": "DejaVu Sans",
         "FontSize": 14,
         "PrimaryColour": "&HDDDDDD&",   # light grey
         "OutlineColour": "&H000000&",   # black
@@ -1683,7 +1683,7 @@ CAPTION_STYLES = {
     },
     # ── OpusClip-style animated presets ──────────────────────────────────
     "neon-pop": {
-        "FontName": "Arial Black",
+        "FontName": "DejaVu Sans",
         "FontSize": 24,
         "PrimaryColour": "&HFFFF00&",   # cyan (BGR: 00FFFF)
         "OutlineColour": "&H000000&",   # black
@@ -1694,7 +1694,7 @@ CAPTION_STYLES = {
         "Alignment": 2,
     },
     "word-highlight": {
-        "FontName": "Arial Black",
+        "FontName": "DejaVu Sans",
         "FontSize": 22,
         "PrimaryColour": "&HFFFFFF&",   # white
         "OutlineColour": "&H00FFFF&",   # yellow (BGR: FFFF00)
@@ -1705,7 +1705,7 @@ CAPTION_STYLES = {
         "Alignment": 2,
     },
     "bouncy": {
-        "FontName": "Arial Black",
+        "FontName": "DejaVu Sans",
         "FontSize": 24,
         "PrimaryColour": "&HFFFFFF&",   # white
         "OutlineColour": "&H000000&",   # black
@@ -1716,7 +1716,7 @@ CAPTION_STYLES = {
         "Alignment": 2,
     },
     "gradient": {
-        "FontName": "Arial Black",
+        "FontName": "DejaVu Sans",
         "FontSize": 26,
         "PrimaryColour": "&H00EDFF&",  # orange-yellow gradient feel
         "OutlineColour": "&H000000&",
@@ -1727,7 +1727,7 @@ CAPTION_STYLES = {
         "Alignment": 2,
     },
     "bold-box": {
-        "FontName": "Arial Black",
+        "FontName": "DejaVu Sans",
         "FontSize": 22,
         "PrimaryColour": "&HFFFFFF&",   # white
         "OutlineColour": "&H000000&",   # black
@@ -1738,7 +1738,7 @@ CAPTION_STYLES = {
         "Alignment": 2,
     },
     "typewriter": {
-        "FontName": "Consolas",
+        "FontName": "DejaVu Sans Mono",
         "FontSize": 20,
         "PrimaryColour": "&H00FF00&",   # green (BGR: 00FF00)
         "OutlineColour": "&H000000&",
@@ -1749,7 +1749,7 @@ CAPTION_STYLES = {
         "Alignment": 2,
     },
     "shake": {
-        "FontName": "Arial Black",
+        "FontName": "DejaVu Sans",
         "FontSize": 26,
         "PrimaryColour": "&H5533FF&",   # red (BGR: FF3355)
         "OutlineColour": "&H000000&",
@@ -1760,7 +1760,7 @@ CAPTION_STYLES = {
         "Alignment": 2,
     },
     "rainbow": {
-        "FontName": "Arial Black",
+        "FontName": "DejaVu Sans",
         "FontSize": 22,
         "PrimaryColour": "&HFFFFFF&",   # white (rainbow done via per-word color cycling)
         "OutlineColour": "&H000000&",
@@ -1771,7 +1771,7 @@ CAPTION_STYLES = {
         "Alignment": 2,
     },
     "outline-glow": {
-        "FontName": "Arial Black",
+        "FontName": "DejaVu Sans",
         "FontSize": 24,
         "PrimaryColour": "&HFFFFFF&",   # white
         "OutlineColour": "&H7C55A8&",   # purple (BGR: A8557C)
@@ -1903,20 +1903,20 @@ def _generate_clip_srt(
 
     # Style configuration per preset
     STYLE_CONFIG = {
-        "white":         {"font": "Arial",       "size": 48, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 3, "shadow": 1, "bold": True},
-        "yellow":        {"font": "Arial",       "size": 52, "primary": "&H0000FFFF&", "outline_c": "&H00000000&", "outline": 4, "shadow": 0, "bold": True},
-        "karaoke":       {"font": "Arial",       "size": 56, "primary": "&H00FFFFFF&", "outline_c": "&H000000FF&", "outline": 4, "shadow": 1, "bold": True},
-        "tiktok":        {"font": "Arial Black",  "size": 64, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 6, "shadow": 0, "bold": True},
-        "minimal":       {"font": "Arial",       "size": 36, "primary": "&H00DDDDDD&", "outline_c": "&H00000000&", "outline": 1, "shadow": 0, "bold": False},
-        "neon-pop":      {"font": "Arial Black",  "size": 56, "primary": "&H00FFFF00&", "outline_c": "&H00000000&", "outline": 3, "shadow": 4, "bold": True},
-        "word-highlight":{"font": "Arial Black",  "size": 52, "primary": "&H00FFFFFF&", "outline_c": "&H0000FFFF&", "outline": 5, "shadow": 0, "bold": True},
-        "bouncy":        {"font": "Arial Black",  "size": 56, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 5, "shadow": 2, "bold": True},
-        "gradient":      {"font": "Arial Black",  "size": 60, "primary": "&H0000EDFF&", "outline_c": "&H00000000&", "outline": 4, "shadow": 0, "bold": True},
-        "bold-box":      {"font": "Arial Black",  "size": 52, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 0, "shadow": 0, "bold": True},
-        "typewriter":    {"font": "Consolas",     "size": 48, "primary": "&H0000FF00&", "outline_c": "&H00000000&", "outline": 2, "shadow": 1, "bold": False},
-        "shake":         {"font": "Arial Black",  "size": 60, "primary": "&H005533FF&", "outline_c": "&H00000000&", "outline": 6, "shadow": 0, "bold": True},
-        "rainbow":       {"font": "Arial Black",  "size": 52, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 4, "shadow": 0, "bold": True},
-        "outline-glow":  {"font": "Arial Black",  "size": 56, "primary": "&H00FFFFFF&", "outline_c": "&H007C55A8&", "outline": 4, "shadow": 5, "bold": True},
+        "white":         {"font": "DejaVu Sans",       "size": 48, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 3, "shadow": 1, "bold": True},
+        "yellow":        {"font": "DejaVu Sans",       "size": 52, "primary": "&H0000FFFF&", "outline_c": "&H00000000&", "outline": 4, "shadow": 0, "bold": True},
+        "karaoke":       {"font": "DejaVu Sans",       "size": 56, "primary": "&H00FFFFFF&", "outline_c": "&H000000FF&", "outline": 4, "shadow": 1, "bold": True},
+        "tiktok":        {"font": "DejaVu Sans",  "size": 64, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 6, "shadow": 0, "bold": True},
+        "minimal":       {"font": "DejaVu Sans",       "size": 36, "primary": "&H00DDDDDD&", "outline_c": "&H00000000&", "outline": 1, "shadow": 0, "bold": False},
+        "neon-pop":      {"font": "DejaVu Sans",  "size": 56, "primary": "&H00FFFF00&", "outline_c": "&H00000000&", "outline": 3, "shadow": 4, "bold": True},
+        "word-highlight":{"font": "DejaVu Sans",  "size": 52, "primary": "&H00FFFFFF&", "outline_c": "&H0000FFFF&", "outline": 5, "shadow": 0, "bold": True},
+        "bouncy":        {"font": "DejaVu Sans",  "size": 56, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 5, "shadow": 2, "bold": True},
+        "gradient":      {"font": "DejaVu Sans",  "size": 60, "primary": "&H0000EDFF&", "outline_c": "&H00000000&", "outline": 4, "shadow": 0, "bold": True},
+        "bold-box":      {"font": "DejaVu Sans",  "size": 52, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 0, "shadow": 0, "bold": True},
+        "typewriter":    {"font": "DejaVu Sans Mono",     "size": 48, "primary": "&H0000FF00&", "outline_c": "&H00000000&", "outline": 2, "shadow": 1, "bold": False},
+        "shake":         {"font": "DejaVu Sans",  "size": 60, "primary": "&H005533FF&", "outline_c": "&H00000000&", "outline": 6, "shadow": 0, "bold": True},
+        "rainbow":       {"font": "DejaVu Sans",  "size": 52, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 4, "shadow": 0, "bold": True},
+        "outline-glow":  {"font": "DejaVu Sans",  "size": 56, "primary": "&H00FFFFFF&", "outline_c": "&H007C55A8&", "outline": 4, "shadow": 5, "bold": True},
     }
 
     # Karaoke highlight color (the color words fill INTO as spoken)
@@ -2747,121 +2747,6 @@ def _run_pipeline_background(job_id: str, source_url: str, transcript: str, refr
             moments["clips"] = clips
             if moments.get("topRecommendation") and clips:
                 moments["topRecommendation"]["title"] = clips[0].get("title", "")
-
-        # Save analysis results (with segments for caption lookup later)
-        job_store.update(
-            job_id,
-            status="analyzing",
-            progress=90,
-            clip_count=len(clips),
-            analysis_json=json.dumps(moments),
-            segments_json=json.dumps(segments),
-        )
-
-        # ── AUTO-REFRAME: download + reframe + upload all clips ────────────
-        # Instead of stopping at timestamps, we now produce finished videos.
-        # Each clip is downloaded as a segment, reframed to 9:16 with captions
-        # burned in, and uploaded to R2 — all in parallel.
-        rc = reframe_config or {}
-        if clips and rc.get("autoReframe", True):
-            job_store.update(job_id, status="reframing", progress=92)
-            print(f"[pipeline {job_id}] Auto-reframing {len(clips)} clips...")
-
-            webcam_corner = None
-            if rc.get("autoDetectWebcam", True):
-                has_webcam = None  # auto-detect
-            else:
-                corner = rc.get("webcamCorner", "none")
-                if corner and corner != "none":
-                    has_webcam = True
-                    webcam_corner = corner
-                else:
-                    has_webcam = False
-
-            enable_captions = rc.get("enableCaptions", True)
-            caption_style = rc.get("captionStyle", "karaoke")
-
-            reframed_clips = []
-            errors = []
-
-            def _reframe_one(clip_idx: int, clip: Dict[str, Any]) -> Dict[str, Any]:
-                """Download + reframe a single clip. Returns result dict."""
-                sub_job_id = f"{job_id}_{clip_idx}"
-                start_t = clip.get("startTime", 0)
-                end_t = clip.get("endTime", 0)
-                title = clip.get("title", f"Clip {clip_idx + 1}")
-                print(f"[pipeline {job_id}] Reframing clip {clip_idx}: {title} ({start_t:.1f}-{end_t:.1f}s)")
-
-                download_result = _retry(
-                    lambda: download_clip_segment(
-                        url=source_url, job_id=sub_job_id,
-                        start_time=start_t, end_time=end_t,
-                    ),
-                    attempts=2, backoff=3.0, label=f"auto-reframe-download-{clip_idx}",
-                )
-                video_path = download_result["videoPath"]
-                segment_offset = download_result.get("segmentOffset", 0.0)
-                local_start = max(0.0, start_t - segment_offset)
-                local_end = end_t - segment_offset
-
-                try:
-                    result = process_single_clip(
-                        video_path=video_path,
-                        start_time=local_start,
-                        end_time=local_end,
-                        clip_title=title,
-                        has_webcam=has_webcam,
-                        webcam_position=rc.get("webcamPosition", "top"),
-                        background_position=rc.get("backgroundPosition", "bottom"),
-                        enable_captions=enable_captions,
-                        caption_style=caption_style,
-                        job_id=sub_job_id,
-                        transcript_segments=segments,
-                        segment_offset=segment_offset,
-                        webcam_corner=webcam_corner,
-                    )
-                    # Merge analysis data with reframe result
-                    result["startTime"] = clip.get("startTime", 0)
-                    result["endTime"] = clip.get("endTime", 0)
-                    result["viralScore"] = clip.get("viralScore", 0)
-                    result["hookScore"] = clip.get("hookScore", 0)
-                    result["pacingScore"] = clip.get("pacingScore", 0)
-                    result["payoffScore"] = clip.get("payoffScore", 0)
-                    result["category"] = clip.get("category", "")
-                    result["wordCount"] = clip.get("wordCount", 0)
-                    result["hasCompleteThought"] = clip.get("hasCompleteThought", False)
-                    return result
-                finally:
-                    try:
-                        os.unlink(video_path)
-                    except OSError:
-                        pass
-
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future_to_idx = {}
-                for i, clip in enumerate(clips):
-                    future = executor.submit(_reframe_one, i, clip)
-                    future_to_idx[future] = i
-
-                for future in as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    try:
-                        reframed_clips.append(future.result())
-                    except Exception as e:
-                        print(f"[pipeline {job_id}] Clip {idx} reframe failed: {e}")
-                        errors.append({"clipIndex": idx, "error": str(e)})
-                        # Keep the analysis-only clip as fallback
-                        reframed_clips.append(clips[idx])
-
-            # Sort by original order
-            reframed_clips.sort(key=lambda c: c.get("startTime", 0))
-            moments["clips"] = reframed_clips
-            if moments.get("topRecommendation") and reframed_clips:
-                best = reframed_clips[0]
-                moments["topRecommendation"]["publicUrl"] = best.get("publicUrl", "")
-                moments["topRecommendation"]["thumbnailUrl"] = best.get("thumbnailUrl", "")
-
-            print(f"[pipeline {job_id}] Auto-reframe complete: {len(reframed_clips)} clips, {len(errors)} errors")
 
         job_store.update(
             job_id,
