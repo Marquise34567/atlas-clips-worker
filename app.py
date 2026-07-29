@@ -1154,16 +1154,18 @@ def transcribe_audio(audio_path: str, duration: float = 0) -> List[Dict[str, Any
     return []
 
 
-def _detect_webcam(video_path: str) -> bool:
-    """Detect if a video has a webcam overlay in the top portion.
+def _detect_webcam(video_path: str) -> Optional[Dict[str, Any]]:
+    """Detect if a video has a webcam overlay and which corner it's in.
 
-    Samples a frame at 25% into the video and checks if the top half has
-    a distinct face-like region (higher contrast + edge density than the
-    bottom half, which is typically gameplay).
+    Samples a frame at 25% into the video and scans all 4 corners
+    for faces using OpenCV haar cascade. Returns a dict with:
+      - has_webcam: bool
+      - corner: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' | None
+      - bbox: (x, y, w, h) of the webcam region in the source frame
 
-    For Twitch VODs, the webcam is usually in the top-left or top-center
-    as a small overlay. We check if the top half has significantly more
-    edge detail (face features) than expected for pure gameplay.
+    For Twitch VODs, the webcam is usually a small overlay in a corner.
+    We scan each corner quadrant for faces and pick the one with the
+    largest face as the webcam location.
     """
     try:
         # Extract a frame at 25% into the video
@@ -1178,7 +1180,7 @@ def _detect_webcam(video_path: str) -> bool:
             except (KeyError, ValueError):
                 pass
         if duration <= 0:
-            return False
+            return {"has_webcam": False, "corner": None, "bbox": None}
 
         sample_time = duration * 0.25
         frame_path = str(Path(video_path).parent / "webcam_probe.jpg")
@@ -1188,38 +1190,99 @@ def _detect_webcam(video_path: str) -> bool:
             capture_output=True, text=True, timeout=30,
         )
         if not Path(frame_path).exists():
-            return False
+            return {"has_webcam": False, "corner": None, "bbox": None}
 
-        # Use OpenCV to check for faces in the top half
+        # Use OpenCV to check for faces in each corner quadrant
         try:
             import cv2
             import numpy as np
         except ImportError:
-            # No OpenCV — assume webcam for Twitch VODs (common layout)
+            # No OpenCV — assume webcam top-right for Twitch VODs (common layout)
             Path(frame_path).unlink(missing_ok=True)
-            return True
+            return {"has_webcam": True, "corner": "top-right", "bbox": None}
 
         frame = cv2.imread(frame_path)
         Path(frame_path).unlink(missing_ok=True)
         if frame is None:
-            return False
+            return {"has_webcam": False, "corner": None, "bbox": None}
 
         h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Check top half for faces
-        top_half = gray[:h // 2, :]
         cascade_path = str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml")
         cascade = cv2.CascadeClassifier(cascade_path)
         if cascade.empty():
-            return True  # Fallback: assume webcam
+            return {"has_webcam": True, "corner": "top-right", "bbox": None}
 
-        faces = cascade.detectMultiScale(top_half, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
-        return len(faces) > 0
+        # Define 4 corner quadrants (each is 40% of width/height from the corner)
+        qw = int(w * 0.40)
+        qh = int(h * 0.40)
+        corners = {
+            "top-left":     gray[0:qh, 0:qw],
+            "top-right":    gray[0:qh, w - qw:w],
+            "bottom-left":  gray[h - qh:h, 0:qw],
+            "bottom-right": gray[h - qh:h, w - qw:w],
+        }
+        corner_offsets = {
+            "top-left":     (0, 0),
+            "top-right":    (0, w - qw),
+            "bottom-left":  (h - qh, 0),
+            "bottom-right": (h - qh, w - qw),
+        }
+
+        best_corner = None
+        best_face_area = 0
+        best_face_bbox = None
+
+        for corner_name, corner_img in corners.items():
+            faces = cascade.detectMultiScale(corner_img, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+            for (fx, fy, fw, fh) in faces:
+                # Convert corner-local coords to frame-global coords
+                ox, oy = corner_offsets[corner_name]
+                gx, gy = fx + ox, fy + oy
+                area = fw * fh
+                if area > best_face_area:
+                    best_face_area = area
+                    best_corner = corner_name
+                    best_face_bbox = (gx, gy, fw, fh)
+
+        if best_corner and best_face_area > 0:
+            # Expand the bbox a bit to include the full webcam frame, not just the face
+            gx, gy, fw, fh = best_face_bbox
+            pad_x = int(fw * 0.6)
+            pad_y = int(fh * 0.8)
+            x0 = max(0, gx - pad_x)
+            y0 = max(0, gy - pad_y)
+            x1 = min(w, gx + fw + pad_x)
+            y1 = min(h, gy + fh + pad_y)
+            webcam_bbox = (x0, y0, x1 - x0, y1 - y0)
+            print(f"Webcam detected: corner={best_corner}, bbox={webcam_bbox}")
+            return {"has_webcam": True, "corner": best_corner, "bbox": webcam_bbox}
+
+        # No face found in any corner — also try the full top half (some streams
+        # have the webcam centered top with a large overlay)
+        top_half = gray[:h // 2, :]
+        faces = cascade.detectMultiScale(top_half, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+        if len(faces) > 0:
+            # Pick the largest face
+            largest = max(faces, key=lambda f: f[2] * f[3])
+            fx, fy, fw, fh = largest
+            pad_x = int(fw * 0.6)
+            pad_y = int(fh * 0.8)
+            x0 = max(0, fx - pad_x)
+            y0 = max(0, fy - pad_y)
+            x1 = min(w, fx + fw + pad_x)
+            y1 = min(h // 2, fy + fh + pad_y)
+            webcam_bbox = (x0, y0, x1 - x0, y1 - y0)
+            print(f"Webcam detected: corner=top-center, bbox={webcam_bbox}")
+            return {"has_webcam": True, "corner": "top-left", "bbox": webcam_bbox}
+
+        print("No webcam detected in any corner")
+        return {"has_webcam": False, "corner": None, "bbox": None}
 
     except Exception as e:
         print(f"Webcam detection error: {e}")
-        return True  # Fallback: assume webcam (safe default for Twitch)
+        return {"has_webcam": False, "corner": None, "bbox": None}
 
 
 # Caption style presets — maps a user-facing style name to ffmpeg
@@ -1261,14 +1324,14 @@ CAPTION_STYLES = {
     },
     "tiktok": {
         "FontName": "Arial Black",
-        "FontSize": 28,
+        "FontSize": 32,
         "PrimaryColour": "&HFFFFFF&",   # white
         "OutlineColour": "&H000000&",   # black
-        "BorderStyle": 1,
-        "Outline": 4,
-        "Shadow": 2,
-        "MarginV": 40,
-        "Alignment": 2,                 # bottom center, large
+        "BorderStyle": 1,               # outline only (no opaque box)
+        "Outline": 5,                   # thick outline for pop
+        "Shadow": 0,
+        "MarginV": 0,                   # centered vertically
+        "Alignment": 5,                 # center-center (not bottom)
     },
     "minimal": {
         "FontName": "Arial",
@@ -1303,31 +1366,46 @@ def _build_reframe_filter(
     enable_captions: bool = False,
     srt_path: str = "",
     caption_style: str = "white",
+    webcam_bbox: Optional[tuple] = None,
 ) -> str:
     """Build the ffmpeg filter_complex string for vertical 9:16 reframing.
 
     Layout (720x1280 vertical):
-      - With webcam: top half = webcam (speaker), bottom half = gameplay
-        (or reversed if webcam_position is 'bottom')
-      - Without webcam: full frame = scaled source
-      - Captions: burned into the frame using the selected style preset
+      - With webcam (bbox known): crop webcam region from source, scale to
+        720x640 for the top; scale full source to 720x640 for the bottom.
+      - With webcam (no bbox): split top/bottom halves of source.
+      - Without webcam: full frame scaled to 720x1280.
+      - Captions: burned into the frame using the selected style preset.
+
+    webcam_bbox: (x, y, w, h) in source pixels for the webcam region.
     """
 
     W, H = 720, 1280
     half_h = H // 2  # 640
 
     if has_webcam:
-        # Determine stacking order based on webcam_position
         webcam_on_top = webcam_position not in ("bottom", "bottom-left", "bottom-right")
-        filters = [
-            "[0:v]split=2[webcam_src][bg_src]",
-            # Webcam: top half of source → 720x640
-            f"[webcam_src]crop=iw:ih/2:0:0,scale={W}:{half_h}:force_original_aspect_ratio=increase,"
-            f"crop={W}:{half_h}[webcam]",
-            # Gameplay: bottom half of source → 720x640
-            f"[bg_src]crop=iw:ih/2:0:ih/2,scale={W}:{half_h}:force_original_aspect_ratio=increase,"
-            f"crop={W}:{half_h}[bg]",
-        ]
+        if webcam_bbox and len(webcam_bbox) == 4:
+            bx, by, bw, bh = webcam_bbox
+            # Crop the webcam region from the source, scale to 720x640
+            # Scale full source for the gameplay background, crop to 720x640
+            filters = [
+                # Webcam: crop the detected region → scale to fill 720x640
+                f"[0:v]crop={bw}:{bh}:{bx}:{by},scale={W}:{half_h}:force_original_aspect_ratio=increase,"
+                f"crop={W}:{half_h}[webcam]",
+                # Gameplay: scale full source to 720x640 (center crop)
+                f"[0:v]scale={W}:{half_h}:force_original_aspect_ratio=increase,"
+                f"crop={W}:{half_h}[bg]",
+            ]
+        else:
+            # No bbox — fall back to top/bottom half split
+            filters = [
+                "[0:v]split=2[webcam_src][bg_src]",
+                f"[webcam_src]crop=iw:ih/2:0:0,scale={W}:{half_h}:force_original_aspect_ratio=increase,"
+                f"crop={W}:{half_h}[webcam]",
+                f"[bg_src]crop=iw:ih/2:0:ih/2,scale={W}:{half_h}:force_original_aspect_ratio=increase,"
+                f"crop={W}:{half_h}[bg]",
+            ]
         if webcam_on_top:
             filters.append("[webcam][bg]vstack[stacked]")
         else:
@@ -1358,15 +1436,20 @@ def _generate_clip_srt(
     end_time: float,
     segment_offset: float,
     job_id: str,
+    caption_style: str = "white",
 ) -> str:
     """Generate an SRT subtitle file for the clip's transcript segments.
 
     Adjusts timestamps to be relative to the clip start (0-based).
+    For 'tiktok' style, splits text into 1-3 word chunks that pop in/out
+    quickly (like real TikTok captions). For other styles, uses full
+    segment text per entry.
     Returns the path to the .srt file.
     """
     srt_path = str(WORK_DIR / job_id / f"captions_{uuid.uuid4().hex[:8]}.srt")
     entries = []
     idx = 1
+
     for seg in segments:
         seg_start = float(seg.get("start", 0))
         seg_end = float(seg.get("end", 0))
@@ -1382,10 +1465,56 @@ def _generate_clip_srt(
         # Make relative to clip start (0-based for the output video)
         rel_start = clamped_start - start_time
         rel_end = clamped_end - start_time
-        if rel_end - rel_start < 0.1:
+        seg_duration = rel_end - rel_start
+        if seg_duration < 0.1:
             continue
-        entries.append(f"{idx}\n{_format_srt_time(rel_start)} --> {_format_srt_time(rel_end)}\n{text}\n")
-        idx += 1
+
+        if caption_style == "tiktok":
+            # Split into word groups of 1-3 words for TikTok-style captions
+            words = text.split()
+            if not words:
+                continue
+            # Group words: 1 word if long, 2-3 if short
+            chunks = []
+            i = 0
+            while i < len(words):
+                # Take 1-3 words per chunk
+                remaining = len(words) - i
+                if remaining <= 1:
+                    chunks.append([words[i]])
+                    i += 1
+                elif remaining == 2:
+                    chunks.append([words[i], words[i + 1]])
+                    i += 2
+                else:
+                    # Take 2-3 words, prefer 3 for short words
+                    word_len = len(words[i])
+                    if word_len > 8:
+                        chunks.append([words[i]])
+                        i += 1
+                    else:
+                        chunks.append([words[i], words[i + 1], words[i + 2]])
+                        i += 3
+
+            # Distribute time across chunks proportionally
+            total_chars = sum(len(" ".join(c)) for c in chunks)
+            if total_chars == 0:
+                total_chars = 1
+            chunk_start = rel_start
+            for chunk in chunks:
+                chunk_text = " ".join(chunk)
+                chunk_chars = len(chunk_text)
+                chunk_dur = max(0.3, seg_duration * chunk_chars / total_chars)
+                chunk_end = min(rel_end, chunk_start + chunk_dur)
+                entries.append(
+                    f"{idx}\n{_format_srt_time(chunk_start)} --> {_format_srt_time(chunk_end)}\n{chunk_text.upper()}\n"
+                )
+                idx += 1
+                chunk_start = chunk_end
+        else:
+            # Full segment text per entry (movie subtitle style)
+            entries.append(f"{idx}\n{_format_srt_time(rel_start)} --> {_format_srt_time(rel_end)}\n{text}\n")
+            idx += 1
 
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(entries))
@@ -1414,20 +1543,63 @@ def process_single_clip(
     job_id: str = "",
     transcript_segments: Optional[List[Dict[str, Any]]] = None,
     segment_offset: float = 0.0,
+    webcam_corner: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Cut, reframe, and encode a single clip. Uploads to R2.
 
-    If has_webcam is None, auto-detects webcam presence from the video.
+    If has_webcam is None, auto-detects webcam presence + corner from the video.
     webcam_position controls stacking order: 'top' = webcam on top,
     'bottom' = gameplay on top, webcam on bottom.
+    webcam_corner can override the detected corner ('top-left', 'top-right',
+    'bottom-left', 'bottom-right') for manual placement.
     If enable_captions and transcript_segments are provided, burns captions
     using the selected caption_style preset.
     """
 
     # Auto-detect webcam if not specified
+    webcam_bbox = None
     if has_webcam is None:
-        has_webcam = _detect_webcam(video_path)
-        print(f"Webcam auto-detected: {has_webcam}")
+        detection = _detect_webcam(video_path)
+        has_webcam = detection.get("has_webcam", False)
+        webcam_bbox = detection.get("bbox")
+        detected_corner = detection.get("corner")
+        print(f"Webcam auto-detected: has_webcam={has_webcam}, corner={detected_corner}, bbox={webcam_bbox}")
+        # Use detected corner as webcam_position if user didn't explicitly set it
+        if has_webcam and detected_corner:
+            # Map corner to top/bottom for stacking
+            if detected_corner.startswith("top"):
+                webcam_position = "top"
+            else:
+                webcam_position = "bottom"
+    elif has_webcam and webcam_corner:
+        # Manual webcam corner — estimate bbox from corner using source dimensions
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", video_path],
+                capture_output=True, text=True, timeout=15,
+            )
+            if probe.returncode == 0:
+                streams = json.loads(probe.stdout).get("streams", [])
+                for s in streams:
+                    if s.get("codec_type") == "video":
+                        sw = int(s.get("width", 1920))
+                        sh = int(s.get("height", 1080))
+                        break
+                # Estimate webcam region: 25% of width, 30% of height from corner
+                ww = int(sw * 0.25)
+                wh = int(sh * 0.30)
+                corner_map = {
+                    "top-left":     (0, 0),
+                    "top-right":    (sw - ww, 0),
+                    "bottom-left":  (0, sh - wh),
+                    "bottom-right": (sw - ww, sh - wh),
+                }
+                if webcam_corner in corner_map:
+                    bx, by = corner_map[webcam_corner]
+                    webcam_bbox = (bx, by, ww, wh)
+                    print(f"Manual webcam corner={webcam_corner}, bbox={webcam_bbox}")
+        except Exception as e:
+            print(f"Manual webcam bbox estimation error: {e}")
 
     clip_id = str(uuid.uuid4())[:8]
     output_dir = WORK_DIR / job_id / "clips"
@@ -1447,6 +1619,7 @@ def process_single_clip(
         vod_end = end_time + segment_offset
         srt_path = _generate_clip_srt(
             transcript_segments, vod_start, vod_end, segment_offset, job_id,
+            caption_style=caption_style,
         )
 
     filter_str = _build_reframe_filter(
@@ -1456,6 +1629,7 @@ def process_single_clip(
         enable_captions=enable_captions,
         srt_path=srt_path,
         caption_style=caption_style,
+        webcam_bbox=webcam_bbox,
     )
 
     cmd = [
@@ -2004,13 +2178,20 @@ def _run_single_clip_background(
         job_store.update(job_id, status="processing", progress=50)
         rc = reframe_config or {}
         # Webcam handling:
-        # - autoDetectWebcam=true (default): pass None → process_single_clip
-        #   will run face detection on a sample frame.
-        # - autoDetectWebcam=false: use webcamPipFirst as a manual override.
+        # - autoDetectWebcam=true (default): pass has_webcam=None → auto-detect
+        # - autoDetectWebcam=false + webcamCorner='none': no webcam
+        # - autoDetectWebcam=false + webcamCorner='top-left'/'top-right'/etc:
+        #   manual webcam placement — pass the corner to process_single_clip
+        webcam_corner = None
         if rc.get("autoDetectWebcam", True):
             has_webcam = None  # auto-detect
         else:
-            has_webcam = bool(rc.get("webcamPipFirst", True))
+            corner = rc.get("webcamCorner", "none")
+            if corner and corner != "none":
+                has_webcam = True
+                webcam_corner = corner
+            else:
+                has_webcam = False
 
         # Fetch transcript segments from the parent analysis job for captions
         transcript_segments = None
@@ -2038,6 +2219,7 @@ def _run_single_clip_background(
             job_id=job_id,
             transcript_segments=transcript_segments,
             segment_offset=segment_offset,
+            webcam_corner=webcam_corner,
         )
 
         # Clean up the downloaded segment to save disk
