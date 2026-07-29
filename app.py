@@ -2226,7 +2226,7 @@ def process_single_clip(
         output_path,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {result.stderr[-3000:]}")
 
@@ -2837,7 +2837,7 @@ def _run_pipeline_background(job_id: str, source_url: str, transcript: str, refr
                     except OSError:
                         pass
 
-            with ThreadPoolExecutor(max_workers=min(3, len(clips))) as executor:
+            with ThreadPoolExecutor(max_workers=1) as executor:
                 future_to_idx = {}
                 for i, clip in enumerate(clips):
                     future = executor.submit(_reframe_one, i, clip)
