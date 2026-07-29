@@ -1578,17 +1578,71 @@ def _generate_clip_srt(
     job_id: str,
     caption_style: str = "white",
 ) -> str:
-    """Generate an SRT subtitle file for the clip's transcript segments.
+    """Generate an ASS subtitle file with karaoke word-pop effects.
 
-    Adjusts timestamps to be relative to the clip start (0-based).
-    For 'tiktok' style, splits text into 1-3 word chunks that pop in/out
-    quickly (like real TikTok captions). For other styles, uses full
-    segment text per entry.
-    Returns the path to the .srt file.
+    Uses ASS \\kf (karaoke fill) tags for animated word-by-word highlighting.
+    Each word fills with color as the speaker says it (OpusClip-style).
+    Returns the path to the .ass file.
     """
-    srt_path = str(WORK_DIR / job_id / f"captions_{uuid.uuid4().hex[:8]}.srt")
-    entries = []
-    idx = 1
+    ass_path = str(WORK_DIR / job_id / f"captions_{uuid.uuid4().hex[:8]}.ass")
+
+    # Style configuration per preset
+    STYLE_CONFIG = {
+        "white":         {"font": "Arial",       "size": 48, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 3, "shadow": 1, "bold": True},
+        "yellow":        {"font": "Arial",       "size": 52, "primary": "&H0000FFFF&", "outline_c": "&H00000000&", "outline": 4, "shadow": 0, "bold": True},
+        "karaoke":       {"font": "Arial",       "size": 56, "primary": "&H00FFFFFF&", "outline_c": "&H000000FF&", "outline": 4, "shadow": 1, "bold": True},
+        "tiktok":        {"font": "Arial Black",  "size": 64, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 6, "shadow": 0, "bold": True},
+        "minimal":       {"font": "Arial",       "size": 36, "primary": "&H00DDDDDD&", "outline_c": "&H00000000&", "outline": 1, "shadow": 0, "bold": False},
+        "neon-pop":      {"font": "Arial Black",  "size": 56, "primary": "&H00FFFF00&", "outline_c": "&H00000000&", "outline": 3, "shadow": 4, "bold": True},
+        "word-highlight":{"font": "Arial Black",  "size": 52, "primary": "&H00FFFFFF&", "outline_c": "&H0000FFFF&", "outline": 5, "shadow": 0, "bold": True},
+        "bouncy":        {"font": "Arial Black",  "size": 56, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 5, "shadow": 2, "bold": True},
+        "gradient":      {"font": "Arial Black",  "size": 60, "primary": "&H0000EDFF&", "outline_c": "&H00000000&", "outline": 4, "shadow": 0, "bold": True},
+        "bold-box":      {"font": "Arial Black",  "size": 52, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 0, "shadow": 0, "bold": True},
+        "typewriter":    {"font": "Consolas",     "size": 48, "primary": "&H0000FF00&", "outline_c": "&H00000000&", "outline": 2, "shadow": 1, "bold": False},
+        "shake":         {"font": "Arial Black",  "size": 60, "primary": "&H005533FF&", "outline_c": "&H00000000&", "outline": 6, "shadow": 0, "bold": True},
+        "rainbow":       {"font": "Arial Black",  "size": 52, "primary": "&H00FFFFFF&", "outline_c": "&H00000000&", "outline": 4, "shadow": 0, "bold": True},
+        "outline-glow":  {"font": "Arial Black",  "size": 56, "primary": "&H00FFFFFF&", "outline_c": "&H007C55A8&", "outline": 4, "shadow": 5, "bold": True},
+    }
+
+    # Karaoke highlight color (the color words fill INTO as spoken)
+    KARAOKE_COLORS = {
+        "white": "&H0000FFFF&", "yellow": "&H0000FF00&", "karaoke": "&H000000FF&",
+        "tiktok": "&H000000FF&", "minimal": "&H00FFFFFF&", "neon-pop": "&H00FF0000&",
+        "word-highlight": "&H0000FFFF&", "bouncy": "&H000000FF&", "gradient": "&H000000FF&",
+        "bold-box": "&H0000FFFF&", "typewriter": "&H00FFFFFF&", "shake": "&H00FFFFFF&",
+        "rainbow": "&H000000FF&", "outline-glow": "&H0000FFFF&",
+    }
+
+    RAINBOW_COLORS = ["&H000000FF&", "&H0000A5FF&", "&H0000FFFF&", "&H0000FF00&", "&H00FF0000&", "&H00FF00A5&"]
+
+    cfg = STYLE_CONFIG.get(caption_style, STYLE_CONFIG["white"])
+    karaoke_color = KARAOKE_COLORS.get(caption_style, "&H0000FFFF&")
+
+    # Build ASS header
+    header_lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "PlayResX: 720",
+        "PlayResY: 1280",
+        "ScaledBorderAndShadow: yes",
+        "WrapStyle: 2",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,{cfg['font']},{cfg['size']},{cfg['primary']},{karaoke_color},{cfg['outline_c']},{cfg['outline_c']},{'-1' if cfg['bold'] else '0'},0,0,0,100,100,0,0,1,{cfg['outline']},{cfg['shadow']},2,40,40,80,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    def fmt_ass_time(seconds):
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        cs = int((seconds % 1) * 100)
+        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+    events = []
 
     for seg in segments:
         seg_start = float(seg.get("start", 0))
@@ -1596,72 +1650,52 @@ def _generate_clip_srt(
         text = str(seg.get("text", "")).strip()
         if not text:
             continue
-        # Skip segments outside the clip range
         if seg_end < start_time or seg_start > end_time:
             continue
-        # Clamp to clip boundaries
         clamped_start = max(start_time, seg_start)
         clamped_end = min(end_time, seg_end)
-        # Make relative to clip start (0-based for the output video)
         rel_start = clamped_start - start_time
         rel_end = clamped_end - start_time
         seg_duration = rel_end - rel_start
         if seg_duration < 0.1:
             continue
 
-        # Styles that benefit from per-word/per-chunk popping animation
-        WORD_POP_STYLES = {"tiktok", "neon-pop", "word-highlight", "bouncy",
-                           "gradient", "shake", "rainbow", "outline-glow", "typewriter"}
-        if caption_style in WORD_POP_STYLES:
-            # Split into word groups of 1-3 words for pop-style captions
-            words = text.split()
-            if not words:
-                continue
-            # Group words: 1 word if long, 2-3 if short
-            chunks = []
-            i = 0
-            while i < len(words):
-                # Take 1-3 words per chunk
-                remaining = len(words) - i
-                if remaining <= 1:
-                    chunks.append([words[i]])
-                    i += 1
-                elif remaining == 2:
-                    chunks.append([words[i], words[i + 1]])
-                    i += 2
-                else:
-                    # Take 2-3 words, prefer 3 for short words
-                    word_len = len(words[i])
-                    if word_len > 8:
-                        chunks.append([words[i]])
-                        i += 1
-                    else:
-                        chunks.append([words[i], words[i + 1], words[i + 2]])
-                        i += 3
+        words = text.split()
+        if not words:
+            continue
 
-            # Distribute time across chunks proportionally
-            total_chars = sum(len(" ".join(c)) for c in chunks)
-            if total_chars == 0:
-                total_chars = 1
-            chunk_start = rel_start
-            for chunk in chunks:
-                chunk_text = " ".join(chunk)
-                chunk_chars = len(chunk_text)
-                chunk_dur = max(0.3, seg_duration * chunk_chars / total_chars)
-                chunk_end = min(rel_end, chunk_start + chunk_dur)
-                entries.append(
-                    f"{idx}\n{_format_srt_time(chunk_start)} --> {_format_srt_time(chunk_end)}\n{chunk_text.upper()}\n"
-                )
-                idx += 1
-                chunk_start = chunk_end
-        else:
-            # Full segment text per entry (movie subtitle style)
-            entries.append(f"{idx}\n{_format_srt_time(rel_start)} --> {_format_srt_time(rel_end)}\n{text}\n")
-            idx += 1
+        total_chars = sum(len(w) for w in words)
+        if total_chars == 0:
+            total_chars = 1
 
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(entries))
-    return srt_path if entries else ""
+        # Build karaoke line with \kf tags for word-by-word fill animation
+        karaoke_parts = []
+        for wi, word in enumerate(words):
+            word_dur = max(0.15, seg_duration * len(word) / total_chars)
+            cs = int(word_dur * 100)  # centiseconds for ASS \kf
+            word_upper = word.upper()
+            if caption_style == "rainbow":
+                color = RAINBOW_COLORS[wi % len(RAINBOW_COLORS)]
+                karaoke_parts.append(f"\\kf{cs}\\c{color}{word_upper}")
+            else:
+                karaoke_parts.append(f"\\kf{cs}{word_upper}")
+
+        karaoke_text = " ".join(karaoke_parts)
+        # Add fade in/out for smooth pop effect
+        karaoke_text = f"\\fad(80,80){karaoke_text}"
+
+        events.append(
+            f"Dialogue: 0,{fmt_ass_time(rel_start)},{fmt_ass_time(rel_end)},Default,,0,0,0,,{karaoke_text}"
+        )
+
+    if not events:
+        return ""
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(header_lines) + "\n" + "\n".join(events) + "\n")
+
+    print(f"[clip] ASS file written: {ass_path} ({len(events)} events)")
+    return ass_path
 
 
 def _format_srt_time(seconds: float) -> str:
