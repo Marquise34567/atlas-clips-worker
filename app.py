@@ -1530,18 +1530,26 @@ def _build_reframe_filter(
                 f"crop={W}:{half_h}[bg]",
             ]
         else:
-            # No bbox — fall back to top/bottom half split
+            # No bbox — use PIP (picture-in-picture) overlay:
+            # Full source scaled to 720x1280 as background, with a small
+            # webcam crop (top-right corner, 25%w x 30%h) overlaid in the
+            # top portion of the vertical video.
+            pip_w = W // 3       # 240px wide PIP
+            pip_h = half_h // 2  # 320px tall PIP
+            # Position the PIP at top of the vertical frame
+            pip_x = (W - pip_w) // 2  # centered horizontally
+            pip_y = 20                 # near the top
             filters = [
-                "[0:v]split=2[webcam_src][bg_src]",
-                f"[webcam_src]crop=iw:ih/2:0:0,scale={W}:{half_h}:force_original_aspect_ratio=increase,"
-                f"crop={W}:{half_h}[webcam]",
-                f"[bg_src]crop=iw:ih/2:0:ih/2,scale={W}:{half_h}:force_original_aspect_ratio=increase,"
-                f"crop={W}:{half_h}[bg]",
+                # Background: full source scaled to 720x1280
+                f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+                f"crop={W}:{H}[bg]",
+                # PIP: crop top-right corner of source (where webcam usually is),
+                # scale to PIP size
+                f"[0:v]crop=iw//4:ih//3:iw-iw//4:0,scale={pip_w}:{pip_h}:force_original_aspect_ratio=increase,"
+                f"crop={pip_w}:{pip_h}[pip]",
+                # Overlay PIP onto background
+                f"[bg][pip]overlay={pip_x}:{pip_y}[stacked]",
             ]
-        if webcam_on_top:
-            filters.append("[webcam][bg]vstack[stacked]")
-        else:
-            filters.append("[bg][webcam]vstack[stacked]")
     else:
         filters = [
             f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
@@ -1745,6 +1753,7 @@ def process_single_clip(
 
     # Generate SRT for captions if enabled and transcript segments available
     srt_path = ""
+    print(f"[clip {job_id}] enable_captions={enable_captions}, transcript_segments={'yes' if transcript_segments else 'NO'}, segment_offset={segment_offset}")
     if enable_captions and transcript_segments:
         # The transcript segments have timestamps relative to the ORIGINAL VOD.
         # The downloaded segment starts at segment_offset in the VOD.
@@ -1756,6 +1765,10 @@ def process_single_clip(
             transcript_segments, vod_start, vod_end, segment_offset, job_id,
             caption_style=caption_style,
         )
+        print(f"[clip {job_id}] SRT generated: path={srt_path}, exists={os.path.exists(srt_path) if srt_path else 'N/A'}")
+    elif enable_captions and not transcript_segments:
+        print(f"[clip {job_id}] WARNING: captions enabled but no transcript segments - captions will NOT be burned in")
+    print(f"[clip {job_id}] webcam: has_webcam={has_webcam}, position={webcam_position}, bbox={webcam_bbox}, corner={webcam_corner}")
 
     filter_str = _build_reframe_filter(
         has_webcam=has_webcam,
@@ -2334,12 +2347,20 @@ def _run_single_clip_background(
             # The reframe job's source_url matches the parent job's source_url.
             # Find the parent analysis job (completed, has segments_json).
             all_jobs = job_store.list()
+            print(f"[reframe {job_id}] Searching {len(all_jobs)} jobs for segments matching {source_url}")
             for j in all_jobs:
-                if j.get("source_url") == source_url and j.get("segments"):
-                    transcript_segments = j["segments"]
+                jid = j.get("id", "?")
+                jsegs = j.get("segments")
+                jurl = j.get("source_url", "")
+                print(f"[reframe {job_id}]   job={jid} url={jurl[:40]} segs={bool(jsegs)} status={j.get('status')}")
+                if jurl == source_url and jsegs:
+                    transcript_segments = jsegs
+                    print(f"[reframe {job_id}] Found transcript segments from job {jid}: {len(transcript_segments)} segments")
                     break
-        except Exception:
-            pass
+            if not transcript_segments:
+                print(f"[reframe {job_id}] WARNING: No transcript segments found - captions will NOT be burned in")
+        except Exception as e:
+            print(f"[reframe {job_id}] Error fetching transcript segments: {e}")
 
         result = process_single_clip(
             video_path=video_path,
