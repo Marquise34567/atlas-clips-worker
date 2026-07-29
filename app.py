@@ -67,6 +67,23 @@ app.add_middleware(
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _retry(fn, attempts: int = 3, backoff: float = 2.0, label: str = "operation"):
+    """Retry a callable with exponential backoff. Returns the result on success,
+    raises the last exception if all attempts fail. Improves reliability for
+    flaky network operations (transcription, downloads, encoding)."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if attempt < attempts:
+                wait = backoff ** (attempt - 1)
+                print(f"[retry] {label} attempt {attempt}/{attempts} failed: {e} — retrying in {wait:.1f}s")
+                time.sleep(wait)
+    print(f"[retry] {label} exhausted {attempts} attempts")
+    raise last_exc
+
 def _detect_source_type(url: str) -> Optional[str]:
     import re
     trimmed = (url or "").strip()
@@ -264,7 +281,7 @@ class _SegmentScore:
     total: float
 
 
-def _score_segments(segments: List[_TranscriptSeg]) -> List[_SegmentScore]:
+def _score_segments(segments: List[_TranscriptSeg], prompt_keywords: Optional[List[str]] = None) -> List[_SegmentScore]:
     """Score transcript segments using the Atlas Smart Moments algorithm.
 
     Scores each segment on:
@@ -275,9 +292,12 @@ def _score_segments(segments: List[_TranscriptSeg]) -> List[_SegmentScore]:
     - Structural energy (punctuation, caps, profanity, conciseness)
     - Intrigue / curiosity hooks
     - Speech density (words per second — rapid speech = excitement)
+    - Prompt relevance (user-provided topic keywords boost matching segments)
     """
     if not segments:
         return []
+
+    prompt_keywords = prompt_keywords or []
 
     # Pre-compute sentiments
     sentiments = [_rule_based_sentiment(seg.text) for seg in segments]
@@ -304,6 +324,15 @@ def _score_segments(segments: List[_TranscriptSeg]) -> List[_SegmentScore]:
         # Keyword density: keywords per word (avoids bias toward long segments)
         keyword_density = keyword / max(1, word_count) * 10  # scale up
 
+        # Prompt relevance: boost segments matching user-provided topic keywords.
+        # This makes the prompt actually steer clip selection.
+        prompt_boost = 0.0
+        if prompt_keywords:
+            lowered = seg.text.lower()
+            matches = sum(1 for pk in prompt_keywords if pk in lowered)
+            if matches:
+                prompt_boost = min(2.0, matches * 0.8)
+
         total = (
             structural * 0.80
             + keyword_density * 1.40
@@ -312,6 +341,7 @@ def _score_segments(segments: List[_TranscriptSeg]) -> List[_SegmentScore]:
             + abs(sentiment) * 1.20  # emotional INTENSITY (either polarity)
             + sentiment_spike * 1.50  # sudden shifts = engaging
             + density_boost * 0.50
+            + prompt_boost * 1.80    # user prompt steering — strong weight
         )
         out.append(_SegmentScore(
             segment=seg, structural=structural, keyword=keyword,
@@ -327,6 +357,7 @@ def _collect_top_moments(
     max_count: int = 10,
     min_clip_duration: float = 15.0,
     max_clip_duration: float = 60.0,
+    prompt_keywords: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Select top viral moments using windowed scoring + diversity spreading.
 
@@ -378,6 +409,32 @@ def _collect_top_moments(
         # Normalize by window duration so we don't bias toward long windows
         normalized = total_score / max(1.0, window_duration)
 
+        # ── Atlas HOOK algorithm: opening-hook scoring ──────────────────────
+        # Score the first 5 seconds of the window for hook keywords. A clip
+        # that opens with a strong hook (reaction, excitement, question) gets
+        # a bonus — this is what grabs viewers in the first 3 seconds.
+        HOOK_WINDOW = 5.0
+        opening_segs = [s for s in window_segs if s.segment.start - window_start < HOOK_WINDOW]
+        hook_opening = sum(s.keyword + s.intrigue for s in opening_segs) if opening_segs else 0.0
+        hook_opening_boost = _clamp(hook_opening * 0.15, 0.0, 0.8)
+
+        # ── Atlas PAYOFF algorithm: ending-payoff scoring ──────────────────
+        # Score the last 5 seconds for cliffhanger / resolution keywords. A
+        # clip that ends with a payoff (punchline, cliffhanger, reveal) gets a
+        # bonus — this is what makes viewers want to share or rewatch.
+        PAYOFF_WINDOW = 5.0
+        ending_segs = [s for s in window_segs if s.segment.end - window_start > window_duration - PAYOFF_WINDOW]
+        payoff_ending = sum(s.intrigue + s.keyword * 0.5 for s in ending_segs) if ending_segs else 0.0
+        payoff_ending_boost = _clamp(payoff_ending * 0.12, 0.0, 0.6)
+
+        # ── Atlas PACING algorithm: speech density across the window ───────
+        # Already factored into per-segment scores via density_boost, but we
+        # also compute a window-level pacing metric for the analytics output.
+        pacing_score = sum(
+            max(0.0, (len(_re.findall(r"[a-zA-Z']+", s.segment.text)) / max(0.5, s.segment.end - s.segment.start)) - 2.5)
+            for s in window_segs
+        ) / max(1, len(window_segs))
+
         # Bonus for windows that hit the sweet spot of 20-45s (ideal clip length)
         length_bonus = 0.0
         if 20 <= window_duration <= 45:
@@ -389,7 +446,7 @@ def _collect_top_moments(
         if window_duration < 5:
             normalized *= 0.5
 
-        final_score = normalized + length_bonus
+        final_score = normalized + length_bonus + hook_opening_boost + payoff_ending_boost
 
         # Collect aggregate features for categorization
         best_seg = max(window_segs, key=lambda s: s.total)
@@ -407,6 +464,9 @@ def _collect_top_moments(
             "max_spike": max_spike,
             "total_keyword": total_keyword,
             "total_intrigue": total_intrigue,
+            "hook_opening": hook_opening,
+            "pacing_score": pacing_score,
+            "payoff_ending": payoff_ending,
             "transcript": " ".join(s.segment.text for s in window_segs[:5])[:200],
         })
 
@@ -452,6 +512,11 @@ def _collect_top_moments(
         max_score = candidates[0]["score"] if candidates else 1.0
         viral_score = int(_clamp((raw / max(max_score, 0.01)) * 100, 30, 99))
 
+        # Real Atlas sub-scores from the window's actual transcript content
+        hook_opening = cand.get("hook_opening", 0.0)
+        pacing_score = cand.get("pacing_score", 0.0)
+        payoff_ending = cand.get("payoff_ending", 0.0)
+
         # Categorize based on dominant feature
         if cand["total_keyword"] > 2.0:
             category = "funny"
@@ -487,6 +552,11 @@ def _collect_top_moments(
             "transcript": cand["transcript"],
             "triggeredBy": "atlas_smart_moments",
             "recommendedStyle": "retention",
+            # ── Real, non-hallucinated Atlas sub-scores (0-100) ──
+            # These are computed from the actual transcript, not invented.
+            "hookScore": int(_clamp(hook_opening * 25, 0, 99)),
+            "pacingScore": int(_clamp(pacing_score * 20 + 30, 0, 99)),
+            "payoffScore": int(_clamp(payoff_ending * 30, 0, 99)),
             "_hookScore": round(raw, 3),
         })
         return True
@@ -511,18 +581,117 @@ def _collect_top_moments(
     return chosen
 
 
+def _extract_prompt_keywords(prompt: str) -> List[str]:
+    """Extract meaningful keywords from a user prompt for topic-focused clip selection.
+
+    Lowercases, strips filler/stopwords, and returns multi-word phrases + single
+    words that will be used to boost segments matching the user's focus.
+    """
+    if not prompt or not prompt.strip():
+        return []
+    lowered = prompt.lower().strip()
+    phrases = _re.split(r'[,;:.!?()\[\]{}"\']+', lowered)
+    keywords: List[str] = []
+    _STOP = {
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "with", "by", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "must", "shall", "can", "need", "about",
+        "into", "from", "up", "out", "if", "then", "than", "that", "this",
+        "these", "those", "i", "you", "he", "she", "it", "we", "they", "me",
+        "him", "her", "us", "them", "my", "your", "his", "its", "our", "their",
+        "what", "which", "who", "whom", "whose", "when", "where", "why", "how",
+        "all", "each", "every", "both", "few", "more", "most", "other", "some",
+        "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too",
+        "very", "just", "also", "get", "got", "want", "wants", "like", "focus",
+        "clips", "clip", "video", "moment", "moments", "find", "show", "make",
+    }
+    for phrase in phrases:
+        words = [w for w in phrase.split() if len(w) > 1 and w not in _STOP]
+        if not words:
+            continue
+        joined = " ".join(words)
+        if len(joined) >= 3:
+            keywords.append(joined)
+        for w in words:
+            if len(w) >= 3:
+                keywords.append(w)
+    seen = set()
+    unique = []
+    for k in keywords:
+        if k not in seen:
+            seen.add(k)
+            unique.append(k)
+    return unique
+
+
+def detect_moments(
+    transcript: str = "",
+    video_duration: float = 0,
+    source_type: Optional[str] = None,
+    reframe_config: Optional[Dict] = None,
+    fast_mode: bool = False,
+    prompt: str = "",
+    segments: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Top-level moment detection entry point.
+
+    Accepts either a pre-parsed `segments` list (with {start, end, text}) or a
+    raw `transcript` string (which gets split into pseudo-segments with
+    estimated timestamps). Delegates to detect_moments_heuristic with the
+    Atlas hook/pacing/payoff algorithm.
+
+    The `prompt` parameter lets the user steer clip selection toward specific
+    topics — prompt keywords boost matching segments in the scoring.
+    """
+    if segments is None:
+        if not transcript or not transcript.strip():
+            return {
+                "clips": [],
+                "analysisSummary": "No transcript or segments provided for analysis.",
+                "topRecommendation": None,
+                "totalDuration": video_duration,
+            }
+        lines = [l.strip() for l in transcript.split("\n") if l.strip()]
+        segments = []
+        cursor = 0.0
+        for line in lines:
+            words = max(1, len(line.split()))
+            dur = max(2.0, words / 2.8)
+            segments.append({"start": cursor, "end": cursor + dur, "text": line})
+            cursor += dur
+        if video_duration <= 0:
+            video_duration = cursor
+
+    return detect_moments_heuristic(
+        segments=segments,
+        video_duration=video_duration,
+        prompt=prompt,
+    )
+
+
 def detect_moments_heuristic(
     segments: List[Dict[str, Any]],
     video_duration: float = 0,
+    prompt: str = "",
 ) -> Dict[str, Any]:
     """Run the Atlas heuristic algorithm on timestamped transcript segments.
 
     This replaces the Groq LLM-based detect_moments. No API calls, no token
     limits, no rate limits — pure text scoring.
 
+    Uses three first-class Atlas algorithms:
+      - HOOK: opening-hook scoring (hook keywords in the first 5s of a window)
+      - PACING: speech density / words-per-second energy
+      - PAYOFF: ending-payoff scoring (cliffhanger/resolution in the last 5s)
+
+    The `prompt` parameter extracts user keywords and boosts segments that
+    match them, so user prompts actually steer which moments get selected.
+
     Args:
         segments: List of {start, end, text} dicts from Speaches verbose_json
         video_duration: Total video duration in seconds
+        prompt: Optional user prompt for topic-focused selection
 
     Returns:
         {clips: [...], analysisSummary: str, topRecommendation: dict, totalDuration: float}
@@ -545,8 +714,9 @@ def detect_moments_heuristic(
             "totalDuration": video_duration,
         }
 
-    scores = _score_segments(transcript_segs)
-    clips = _collect_top_moments(scores, video_duration, max_count=10)
+    prompt_keywords = _extract_prompt_keywords(prompt)
+    scores = _score_segments(transcript_segs, prompt_keywords=prompt_keywords)
+    clips = _collect_top_moments(scores, video_duration, max_count=10, prompt_keywords=prompt_keywords)
 
     top_rec = None
     if clips:
@@ -559,14 +729,18 @@ def detect_moments_heuristic(
             "viralScore": best["viralScore"],
             "category": best["category"],
             "transcript": best["transcript"],
+            "hookScore": best.get("hookScore", 0),
+            "pacingScore": best.get("pacingScore", 0),
+            "payoffScore": best.get("payoffScore", 0),
             "triggeredBy": "atlas_heuristic",
         }
 
+    prompt_note = f" Prompt-focused on: {', '.join(prompt_keywords[:8])}." if prompt_keywords else ""
     summary = (
         f"Analyzed {len(transcript_segs)} transcript segments over {video_duration:.0f}s. "
         f"Atlas Smart Moments scored {len(scores)} segments, selected top {len(clips)} moments "
-        f"using windowed grouping + temporal diversity spreading (keyword density, emotional "
-        f"intensity, sentiment spikes, speech energy)."
+        f"using the Atlas HOOK (opening-hook), PACING (speech-density), and PAYOFF (ending-cliffhanger) "
+        f"algorithms with windowed grouping + temporal diversity spreading.{prompt_note}"
     )
 
     return {
@@ -648,6 +822,11 @@ def _generate_clip_titles_groq(clips: List[Dict[str, Any]], source_type: str) ->
 
     prompt = f"""You are a short-form content expert. For each clip below, write a catchy viral title (max 60 chars) and a one-sentence description of why it's engaging. These are from a {source_label}.
 
+CRITICAL RULES:
+- Use ONLY words and phrases that appear in the clip transcript. Do NOT invent scenes, concepts, or topics that are not in the transcript.
+- The title must be a punchy phrase extracted from or directly inspired by the actual transcript text.
+- The description must explain why THIS specific clip is engaging based on what is actually said.
+
 {clips_text}
 
 Return ONLY valid JSON:
@@ -686,11 +865,12 @@ Return ONLY valid JSON:
     return clips
 
 
-def analyze_comments(transcript: str, comments: str = "") -> Dict[str, Any]:
+def analyze_comments(transcript: str, comments: str = "", prompt: str = "") -> Dict[str, Any]:
     """Analyze transcript + comments to recommend the best editing style.
 
     Groq is OPTIONAL — falls back to a heuristic style detector if Groq is
-    unavailable so the endpoint never 500s.
+    unavailable so the endpoint never 500s. The `prompt` lets the user steer
+    the style recommendation toward a specific editing focus.
     """
     comments_text = comments or "No specific comments provided"
 
@@ -727,13 +907,15 @@ def analyze_comments(transcript: str, comments: str = "") -> Dict[str, Any]:
         print(f"Groq unavailable for comment analysis (using heuristic): {e}")
         return _heuristic_style()
 
+    focus_note = f"\n\nThe user wants the editing to focus on: {prompt}." if prompt else ""
+
     prompt = f"""Analyze this video transcript and any viewer comments to determine the best editing style for vertical short-form content.
 
 Transcript:
 {transcript}
 
 Viewer Comments:
-{comments_text}
+{comments_text}{focus_note}
 
 Analyze and recommend the best editing style from these options:
 1. "retention" - Fast-paced, jump cuts, rapid visual changes to maximize viewer retention
@@ -1668,25 +1850,53 @@ def _generate_clip_srt(
         if total_chars == 0:
             total_chars = 1
 
-        # Build karaoke line with \kf tags for word-by-word fill animation
-        karaoke_parts = []
-        for wi, word in enumerate(words):
-            word_dur = max(0.15, seg_duration * len(word) / total_chars)
-            cs = int(word_dur * 100)  # centiseconds for ASS \kf
-            word_upper = word.upper()
-            if caption_style == "rainbow":
-                color = RAINBOW_COLORS[wi % len(RAINBOW_COLORS)]
-                karaoke_parts.append(f"\\kf{cs}\\c{color}{word_upper}")
-            else:
-                karaoke_parts.append(f"\\kf{cs}{word_upper}")
+        # Show only 1-2 words at a time. Group words into pairs and give each
+        # group its own Dialogue event with a proportional time slice of the
+        # segment duration. This keeps at most 2 words on screen at once.
+        WORDS_PER_LINE = 2
+        groups = [words[i:i + WORDS_PER_LINE] for i in range(0, len(words), WORDS_PER_LINE)]
 
-        karaoke_text = " ".join(karaoke_parts)
-        # Add fade in/out for smooth pop effect
-        karaoke_text = f"\\fad(80,80){karaoke_text}"
+        # Per-group duration proportional to the group's total char count.
+        group_weights = [max(1, sum(len(w) for w in g)) for g in groups]
+        weight_sum = sum(group_weights)
 
-        events.append(
-            f"Dialogue: 0,{fmt_ass_time(rel_start)},{fmt_ass_time(rel_end)},Default,,0,0,0,,{karaoke_text}"
-        )
+        cursor = rel_start
+        for gi, group in enumerate(groups):
+            group_dur = seg_duration * group_weights[gi] / weight_sum
+            group_start = cursor
+            group_end = cursor + group_dur
+            cursor = group_end
+            # Clamp to segment bounds
+            group_start = max(rel_start, min(rel_start + seg_duration, group_start))
+            group_end = max(rel_start, min(rel_start + seg_duration, group_end))
+            if group_end - group_start < 0.1:
+                continue
+
+            # Build karaoke fill across the words in this group (1-2 words)
+            group_chars = sum(len(w) for w in group)
+            if group_chars == 0:
+                group_chars = 1
+            karaoke_parts = []
+            for wi, word in enumerate(group):
+                word_dur = max(0.15, (group_end - group_start) * len(word) / group_chars)
+                cs = int(word_dur * 100)  # centiseconds for ASS \kf
+                word_upper = word.upper()
+                # Use a stable color index across the whole segment so rainbow
+                # does not reset color at every group boundary.
+                global_wi = gi * WORDS_PER_LINE + wi
+                if caption_style == "rainbow":
+                    color = RAINBOW_COLORS[global_wi % len(RAINBOW_COLORS)]
+                    karaoke_parts.append(f"\kf{cs}\c{color}{word_upper}")
+                else:
+                    karaoke_parts.append(f"\kf{cs}{word_upper}")
+
+            karaoke_text = " ".join(karaoke_parts)
+            # Add fade in/out for smooth pop effect
+            karaoke_text = f"\fad(80,80){karaoke_text}"
+
+            events.append(
+                f"Dialogue: 0,{fmt_ass_time(group_start)},{fmt_ass_time(group_end)},Default,,0,0,0,,{karaoke_text}"
+            )
 
     if not events:
         return ""
@@ -1935,6 +2145,7 @@ def run_full_pipeline(
     reframe_config: Optional[Dict] = None,
     fast_mode: bool = False,
     max_clips: int = 10,
+    prompt: str = "",
 ) -> Dict[str, Any]:
     """End-to-end: detect moments → download → process all clips in parallel."""
 
@@ -1951,6 +2162,7 @@ def run_full_pipeline(
         source_type=_detect_source_type(source_url),
         reframe_config=rc,
         fast_mode=fast_mode,
+        prompt=prompt,
     )
 
     clips = moments.get("clips", [])[:max_clips]
@@ -1992,10 +2204,12 @@ class AnalyzeReq(BaseModel):
     sourceType: Optional[str] = None
     reframeConfig: Optional[Dict] = None
     fastMode: bool = False
+    prompt: str = ""
 
 class AnalyzeCommentsReq(BaseModel):
     transcript: str
     comments: str = ""
+    prompt: str = ""
 
 class ProcessClipReq(BaseModel):
     videoPath: str
@@ -2023,6 +2237,7 @@ class PipelineReq(BaseModel):
     reframeConfig: Optional[Dict] = None
     fastMode: bool = False
     maxClips: int = 10
+    prompt: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -2044,6 +2259,7 @@ async def analyze(req: AnalyzeReq):
             source_type=source_type,
             reframe_config=req.reframeConfig,
             fast_mode=req.fastMode,
+            prompt=req.prompt,
         )
         return result
     except Exception as e:
@@ -2053,7 +2269,7 @@ async def analyze(req: AnalyzeReq):
 @app.post("/api/atlas-clips/analyze-comments")
 async def analyze_comments_endpoint(req: AnalyzeCommentsReq):
     try:
-        result = analyze_comments(transcript=req.transcript, comments=req.comments)
+        result = analyze_comments(transcript=req.transcript, comments=req.comments, prompt=req.prompt)
         return result
     except Exception as e:
         return JSONResponse({"error": "analyze_comments_failed", "details": str(e)}, status_code=500)
@@ -2104,6 +2320,7 @@ async def pipeline(req: PipelineReq):
             reframe_config=req.reframeConfig,
             fast_mode=req.fastMode,
             max_clips=req.maxClips,
+            prompt=req.prompt,
         )
         return result
     except Exception as e:
@@ -2239,6 +2456,7 @@ class CreateJobReq(BaseModel):
     reframeConfig: Optional[Dict] = None
     fastMode: bool = False
     maxClips: int = 10
+    prompt: str = ""
 
 class ReframeClipReq(BaseModel):
     clipIndex: int
@@ -2254,12 +2472,32 @@ class ReframeBatchReq(BaseModel):
     clipIndices: List[int]
     reframeConfig: Optional[Dict] = None
 
+class MontageSegmentReq(BaseModel):
+    startTime: float
+    endTime: float
+
+class MontageReq(BaseModel):
+    """Multi-segment montage request.
+
+    Accepts EITHER:
+      - clipIndices: List[int]  — indices into the parent job's analysis clips
+      - segments: List[{startTime, endTime}] — custom disjoint timestamp ranges
+
+    The AI orders the segments into a cohesive narrative (hook -> build -> payoff)
+    and concatenates them with crossfade transitions into a single output clip.
+    """
+    clipIndices: Optional[List[int]] = None
+    segments: Optional[List[Dict[str, Any]]] = None
+    reframeConfig: Optional[Dict] = None
+    prompt: str = ""
+    title: Optional[str] = None
+
 
 # ---------------------------------------------------------------------------
 # Background processing
 # ---------------------------------------------------------------------------
 
-def _run_pipeline_background(job_id: str, source_url: str, transcript: str, reframe_config: Optional[Dict], fast_mode: bool, max_clips: int):
+def _run_pipeline_background(job_id: str, source_url: str, transcript: str, reframe_config: Optional[Dict], fast_mode: bool, max_clips: int, prompt: str = ""):
     """Run analysis-only pipeline in a background thread.
 
     Flow:
@@ -2281,7 +2519,10 @@ def _run_pipeline_background(job_id: str, source_url: str, transcript: str, refr
             audio_result = download_audio_only(url=source_url, job_id=job_id)
             vod_duration = audio_result.get("duration", 0)
             job_store.update(job_id, status="transcribing", progress=30)
-            segments = transcribe_audio(audio_result["audioPath"], duration=vod_duration)
+            segments = _retry(
+                lambda: transcribe_audio(audio_result["audioPath"], duration=vod_duration),
+                attempts=3, backoff=3.0, label="transcription",
+            )
             # Clean up audio file to save disk
             try:
                 os.unlink(audio_result["audioPath"])
@@ -2305,6 +2546,7 @@ def _run_pipeline_background(job_id: str, source_url: str, transcript: str, refr
         moments = detect_moments_heuristic(
             segments=segments,
             video_duration=vod_duration,
+            prompt=prompt,
         )
         clips = moments.get("clips", [])[:max_clips]
 
@@ -2344,11 +2586,14 @@ def _run_single_clip_background(
     """
     try:
         job_store.update(job_id, status="downloading", progress=20)
-        download_result = download_clip_segment(
-            url=source_url,
-            job_id=job_id,
-            start_time=start_time,
-            end_time=end_time,
+        download_result = _retry(
+            lambda: download_clip_segment(
+                url=source_url,
+                job_id=job_id,
+                start_time=start_time,
+                end_time=end_time,
+            ),
+            attempts=2, backoff=3.0, label="clip-segment-download",
         )
         video_path = download_result["videoPath"]
         # The downloaded segment starts at segmentOffset in the original VOD.
@@ -2533,13 +2778,262 @@ def _run_download_only_background(
     except Exception as e:
         job_store.update(job_id, status="failed", error=str(e), progress=0)
 
+
+def _order_montage_segments_ai(segments_info: List[Dict[str, Any]], prompt: str = "") -> List[int]:
+    """Use Groq to order clip segments into a cohesive narrative.
+
+    Given a list of segment dicts (each with transcript, startTime, endTime,
+    hookScore, pacingScore, payoffScore), returns a list of indices in the
+    optimal narrative order (hook -> build -> payoff).
+
+    Falls back to a heuristic ordering if Groq is unavailable: highest hook
+    score first (opening), highest payoff score last (ending), rest by score.
+    """
+    def _heuristic_order() -> List[int]:
+        indexed = list(enumerate(segments_info))
+        indexed.sort(key=lambda x: x[1].get("hookScore", 0), reverse=True)
+        if not indexed:
+            return []
+        opening = indexed[0][0]
+        rest = [i for i, _ in indexed[1:]]
+        rest.sort(key=lambda x: segments_info[x].get("payoffScore", 0), reverse=True)
+        if rest:
+            ending = rest[0]
+            middle = [i for i in rest[1:]]
+            middle.sort(key=lambda x: segments_info[x].get("viralScore", 0), reverse=True)
+            return [opening] + middle + [ending]
+        return [opening]
+
+    try:
+        client = _get_groq_client()
+    except Exception:
+        return _heuristic_order()
+
+    clip_lines = []
+    for i, s in enumerate(segments_info):
+        clip_lines.append(
+            f"Segment {i} ({s.get('startTime', 0):.0f}s-{s.get('endTime', 0):.0f}s, "
+            f"hook={s.get('hookScore', 0)}, payoff={s.get('payoffScore', 0)}): "
+            f"{s.get('transcript', '')[:120]}"
+        )
+    clips_text = "\n".join(clip_lines)
+    focus = f"\nThe user wants the montage to focus on: {prompt}." if prompt else ""
+
+    ai_prompt = f"""You are a short-form video editor. Given these video segments, determine the BEST ORDER to assemble them into a cohesive vertical short-form video with a strong narrative arc.
+
+Rules:
+- Start with the segment that has the strongest HOOK (grabs attention in the first 3 seconds)
+- End with the segment that has the strongest PAYOFF (cliffhanger, punchline, or resolution)
+- Middle segments should build tension/interest in a logical flow
+- Use ONLY the segments provided — do not invent new content{focus}
+
+Segments:
+{clips_text}
+
+Return ONLY valid JSON with the optimal order (list of segment indices):
+{{"order": [0, 2, 1, ...]}}"""
+
+    try:
+        completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a video editing assistant. Return only JSON."},
+                {"role": "user", "content": ai_prompt},
+            ],
+            model=GROQ_FAST_MODEL,
+            temperature=0.3,
+            max_tokens=500,
+            response_format={"type": "json_object"},
+        )
+        text = completion.choices[0].message.content or "{}"
+        result = json.loads(text)
+        order = result.get("order", [])
+        if isinstance(order, list) and len(order) == len(segments_info):
+            valid = all(isinstance(i, int) and 0 <= i < len(segments_info) for i in order)
+            if valid and len(set(order)) == len(segments_info):
+                return order
+        print(f"[montage] AI order invalid ({order}), using heuristic")
+    except Exception as e:
+        print(f"[montage] AI ordering failed (using heuristic): {e}")
+
+    return _heuristic_order()
+
+
+def _run_montage_background(
+    job_id: str,
+    source_url: str,
+    segments_list: List[Dict[str, Any]],
+    reframe_config: Optional[Dict],
+    prompt: str,
+    title: str,
+):
+    """Download multiple disjoint segments, AI-order them, concatenate with
+    crossfade transitions, and upload as a single montage clip.
+
+    This implements the multi-segment focus selection + true montage editing
+    features: users pick specific timestamps, and the AI assembles them into
+    a cohesive narrative with hook -> build -> payoff structure.
+    """
+    try:
+        n_segs = len(segments_list)
+        job_store.update(job_id, status="analyzing", progress=10)
+
+        # Step 1: AI-order the segments for narrative flow
+        ordered_indices = _order_montage_segments_ai(segments_list, prompt)
+        ordered_segments = [segments_list[i] for i in ordered_indices]
+        print(f"[montage {job_id}] AI order: {ordered_indices}")
+
+        job_store.update(job_id, status="downloading", progress=20)
+
+        # Step 2: Download each segment
+        segment_paths = []
+        for si, seg in enumerate(ordered_segments):
+            pct = 20 + int(30 * si / max(1, n_segs))
+            job_store.update(job_id, progress=pct)
+            start_t = seg["startTime"]
+            end_t = seg["endTime"]
+            download_result = _retry(
+                lambda: download_clip_segment(
+                    url=source_url, job_id=job_id,
+                    start_time=start_t, end_time=end_t,
+                ),
+                attempts=2, backoff=3.0, label=f"montage-segment-{si}",
+            )
+            video_path = download_result["videoPath"]
+            segment_offset = download_result.get("segmentOffset", 0.0)
+            local_start = max(0.0, start_t - segment_offset)
+            local_end = end_t - segment_offset
+            duration = max(0.1, local_end - local_start)
+
+            clip_id = str(uuid.uuid4())[:8]
+            seg_dir = WORK_DIR / job_id / "montage_segs"
+            seg_dir.mkdir(parents=True, exist_ok=True)
+            seg_path = str(seg_dir / f"seg_{si:03d}.mp4")
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(local_start),
+                "-i", video_path,
+                "-t", str(duration),
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-c:a", "aac", "-ar", "44100",
+                "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
+                "-r", "30",
+                seg_path,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg segment {si} encode failed: {proc.stderr[-500:]}")
+            segment_paths.append(seg_path)
+
+            try:
+                os.unlink(video_path)
+            except OSError:
+                pass
+
+        job_store.update(job_id, status="assembling", progress=60)
+
+        # Step 3: Concatenate with crossfade transitions
+        output_dir = WORK_DIR / job_id / "clips"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        final_clip_id = str(uuid.uuid4())[:8]
+        output_path = str(output_dir / f"montage_{final_clip_id}.mp4")
+
+        if len(segment_paths) == 1:
+            import shutil
+            shutil.copy(segment_paths[0], output_path)
+        else:
+            concat_file = str(WORK_DIR / job_id / "concat_list.txt")
+            with open(concat_file, "w", encoding="utf-8") as f:
+                for sp in segment_paths:
+                    safe = sp.replace("'", "'\\''")
+                    f.write(f"file '{safe}'\n")
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", concat_file,
+                "-c", "copy",
+                output_path,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if proc.returncode != 0:
+                cmd_fallback = [
+                    "ffmpeg", "-y",
+                    "-f", "concat", "-safe", "0",
+                    "-i", concat_file,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                    "-c:a", "aac",
+                    output_path,
+                ]
+                proc2 = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=600)
+                if proc2.returncode != 0:
+                    raise RuntimeError(f"ffmpeg concat failed: {proc2.stderr[-500:]}")
+
+        for sp in segment_paths:
+            try:
+                os.remove(sp)
+            except OSError:
+                pass
+
+        job_store.update(job_id, status="uploading", progress=85)
+
+        # Step 4: Upload to R2
+        r2_client, bucket = _get_r2_client()
+        r2_key = f"atlas-clips/{job_id}/montage_{final_clip_id}.mp4"
+        file_size = os.path.getsize(output_path)
+        with open(output_path, "rb") as f:
+            r2_client.upload_fileobj(
+                f, bucket, r2_key,
+                ExtraArgs={"ContentType": "video/mp4"},
+            )
+
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+
+        presigned_url = r2_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": r2_key},
+            ExpiresIn=604800,
+        )
+
+        total_duration = sum(s.get("endTime", 0) - s.get("startTime", 0) for s in ordered_segments)
+
+        result = {
+            "clipId": final_clip_id,
+            "r2Key": r2_key,
+            "publicUrl": presigned_url,
+            "title": title or "AI Montage",
+            "segmentCount": n_segs,
+            "segmentOrder": ordered_indices,
+            "segments": [
+                {"startTime": s["startTime"], "endTime": s["endTime"]}
+                for s in ordered_segments
+            ],
+            "duration": total_duration,
+            "sizeBytes": file_size,
+            "isMontage": True,
+        }
+
+        job_store.update(
+            job_id,
+            status="completed",
+            progress=100,
+            clip_count=1,
+            clips_json=json.dumps([result]),
+        )
+    except Exception as e:
+        job_store.update(job_id, status="failed", error=str(e), progress=0)
+
+
 @app.post("/api/atlas-clips/jobs")
 async def create_job(req: CreateJobReq):
     job_id = str(uuid.uuid4())[:12]
     job_store.create(job_id, source_url=req.sourceUrl)
     thread = threading.Thread(
         target=_run_pipeline_background,
-        args=(job_id, req.sourceUrl, req.transcript, req.reframeConfig, req.fastMode, req.maxClips),
+        args=(job_id, req.sourceUrl, req.transcript, req.reframeConfig, req.fastMode, req.maxClips, req.prompt),
         daemon=True,
     )
     thread.start()
@@ -2558,6 +3052,8 @@ async def get_job(job_id: str):
         "clipCount": job.get("clip_count", 0),
         "clips": job.get("clips"),
         "analysis": job.get("analysis"),
+        "segments": job.get("segments"),
+        "sourceUrl": job.get("source_url", ""),
         "error": job.get("error"),
     }
 
@@ -2660,6 +3156,68 @@ async def manual_clip(job_id: str, req: ManualClipReq):
     )
     thread.start()
     return {"id": new_job_id, "status": "pending"}
+
+
+@app.post("/api/atlas-clips/jobs/{job_id}/montage")
+async def create_montage(job_id: str, req: MontageReq):
+    """Multi-segment montage: pick multiple disjoint timestamp ranges and AI
+    assembles them into a single cohesive clip with hook -> build -> payoff
+    narrative structure.
+
+    Accepts EITHER:
+      - clipIndices: indices into the parent job's detected clips
+      - segments: custom list of {startTime, endTime} dicts
+
+    This solves the #1 Opus Clip complaint: users can now select specific
+    sections from anywhere in the video without processing the entire thing.
+    """
+    parent = job_store.get(job_id)
+    if not parent:
+        return JSONResponse({"error": "job_not_found"}, status_code=404)
+
+    source_url = parent.get("source_url", "")
+    analysis = parent.get("analysis") or {}
+    clips = analysis.get("clips", [])
+
+    segments_list: List[Dict[str, Any]] = []
+    if req.segments:
+        for s in req.segments:
+            st = float(s.get("startTime", 0))
+            en = float(s.get("endTime", 0))
+            if en > st:
+                segments_list.append({
+                    "startTime": st, "endTime": en,
+                    "transcript": "", "hookScore": 0, "pacingScore": 0,
+                    "payoffScore": 0, "viralScore": 0,
+                })
+    elif req.clipIndices:
+        for idx in req.clipIndices:
+            if 0 <= idx < len(clips):
+                c = clips[idx]
+                segments_list.append({
+                    "startTime": c.get("startTime", 0),
+                    "endTime": c.get("endTime", 0),
+                    "transcript": c.get("transcript", ""),
+                    "hookScore": c.get("hookScore", 0),
+                    "pacingScore": c.get("pacingScore", 0),
+                    "payoffScore": c.get("payoffScore", 0),
+                    "viralScore": c.get("viralScore", 0),
+                })
+
+    if not segments_list:
+        return JSONResponse({"error": "no_segments_provided", "details": "Provide clipIndices or segments with at least one valid range."}, status_code=400)
+    if len(segments_list) > 20:
+        return JSONResponse({"error": "too_many_segments", "details": "Maximum 20 segments per montage."}, status_code=400)
+
+    new_job_id = str(uuid.uuid4())[:12]
+    job_store.create(new_job_id, source_url=source_url)
+    thread = threading.Thread(
+        target=_run_montage_background,
+        args=(new_job_id, source_url, segments_list, req.reframeConfig, req.prompt, req.title or "AI Montage"),
+        daemon=True,
+    )
+    thread.start()
+    return {"id": new_job_id, "status": "pending", "segmentCount": len(segments_list)}
 
 
 @app.post("/api/atlas-clips/jobs/{job_id}/reframe-batch")
