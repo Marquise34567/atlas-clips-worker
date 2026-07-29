@@ -739,6 +739,85 @@ def download_source(url: str, job_id: str) -> Dict[str, Any]:
     }
 
 
+def download_clip_segment(
+    url: str,
+    job_id: str,
+    start_time: float,
+    end_time: float,
+) -> Dict[str, Any]:
+    """Download ONLY the clip segment (start_time → end_time) from the source.
+
+    Uses yt-dlp's --download-sections to fetch just the timestamp range,
+    avoiding a full VOD download. For a 30s clip from a 3-hour VOD, this
+    downloads ~30s of video instead of 3 hours — 100x+ faster.
+
+    Adds a 5s padding on each side to ensure clean cuts at the boundaries.
+    """
+    source_type = _detect_source_type(url)
+    if not source_type:
+        raise ValueError(f"Unsupported URL: {url}")
+
+    cache_dir = WORK_DIR / job_id
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    output_template = str(cache_dir / "clip_source.%(ext)s")
+
+    # Pad the download range by 5s on each side for clean cuts
+    pad = 5.0
+    dl_start = max(0.0, start_time - pad)
+    dl_end = end_time + pad
+    duration_str = f"{dl_start}-{dl_end}"
+
+    cmd = [
+        "yt-dlp",
+        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
+        "--download-sections", f"*{duration_str}",
+        "--force-keyframes-at-cuts",
+        "-o", output_template,
+        "--no-playlist",
+        "--retries", "3",
+        "--fragment-retries", "3",
+        # Anti-bot workarounds for YouTube
+        "--extractor-args", "youtube:player_client=android,ios,web_safari,web",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        url,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"yt-dlp clip segment failed: {result.stderr[-2000:]}")
+
+    files = list(cache_dir.glob("clip_source.*"))
+    if not files:
+        raise RuntimeError("Clip segment download completed but no file found")
+
+    video_path = str(files[0])
+
+    # Probe the downloaded segment duration
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path],
+        capture_output=True, text=True,
+    )
+    seg_duration = 0.0
+    if probe.returncode == 0:
+        try:
+            seg_duration = float(json.loads(probe.stdout)["format"]["duration"])
+        except (KeyError, ValueError):
+            pass
+
+    return {
+        "videoPath": video_path,
+        "duration": seg_duration,
+        "sourceType": source_type,
+        "sizeBytes": files[0].stat().st_size,
+        # The downloaded segment starts at dl_start in the original VOD.
+        # process_single_clip uses start_time/end_time relative to the
+        # video file, so we need to adjust: the clip starts at
+        # (start_time - dl_start) within the downloaded segment.
+        "segmentOffset": dl_start,
+    }
+
+
 def download_audio_only(url: str, job_id: str) -> Dict[str, Any]:
     """Download only the audio track (fast) for transcription.
 
@@ -1016,12 +1095,14 @@ def _build_reframe_filter(
     webcam_position: str = "top",
     background_position: str = "bottom",
     enable_captions: bool = False,
+    srt_path: str = "",
 ) -> str:
     """Build the ffmpeg filter_complex string for vertical 9:16 reframing.
 
     Layout (1080x1920 vertical):
       - With webcam: top half = webcam (speaker), bottom half = gameplay
       - Without webcam: full frame = scaled source
+      - Captions: burned into the bottom third of the frame
     """
 
     W, H = 1080, 1920
@@ -1037,15 +1118,78 @@ def _build_reframe_filter(
             f"[bg_src]crop=iw:ih/2:0:ih/2,scale={W}:{half_h}:force_original_aspect_ratio=increase,"
             f"crop={W}:{half_h}[bg]",
             # Stack: webcam on top, gameplay on bottom
-            "[webcam][bg]vstack[out]",
+            "[webcam][bg]vstack[stacked]",
         ]
     else:
         filters = [
             f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
-            f"crop={W}:{H}[out]",
+            f"crop={W}:{H}[stacked]",
         ]
 
+    # Burn captions if enabled and SRT file exists
+    if enable_captions and srt_path:
+        # Escape the path for ffmpeg filter (colons and backslashes need escaping)
+        esc_path = srt_path.replace("\\", "/").replace(":", "\\:")
+        # Use subtitles filter to burn captions at the bottom of the frame
+        # Force original aspect ratio off, and style with white text + black outline
+        filters.append(
+            f"[stacked]subtitles='{esc_path}':force_style='FontName=Arial,FontSize=24,"
+            f"PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,"
+            f"Outline=2,Shadow=1,MarginV=80,Alignment=2'[out]"
+        )
+    else:
+        filters.append("[stacked]null[out]")
+
     return ";".join(filters)
+
+
+def _generate_clip_srt(
+    segments: List[Dict[str, Any]],
+    start_time: float,
+    end_time: float,
+    segment_offset: float,
+    job_id: str,
+) -> str:
+    """Generate an SRT subtitle file for the clip's transcript segments.
+
+    Adjusts timestamps to be relative to the clip start (0-based).
+    Returns the path to the .srt file.
+    """
+    srt_path = str(WORK_DIR / job_id / f"captions_{uuid.uuid4().hex[:8]}.srt")
+    entries = []
+    idx = 1
+    for seg in segments:
+        seg_start = float(seg.get("start", 0))
+        seg_end = float(seg.get("end", 0))
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        # Skip segments outside the clip range
+        if seg_end < start_time or seg_start > end_time:
+            continue
+        # Clamp to clip boundaries
+        clamped_start = max(start_time, seg_start)
+        clamped_end = min(end_time, seg_end)
+        # Make relative to clip start (0-based for the output video)
+        rel_start = clamped_start - start_time
+        rel_end = clamped_end - start_time
+        if rel_end - rel_start < 0.1:
+            continue
+        entries.append(f"{idx}\n{_format_srt_time(rel_start)} --> {_format_srt_time(rel_end)}\n{text}\n")
+        idx += 1
+
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(entries))
+    return srt_path if entries else ""
+
+
+def _format_srt_time(seconds: float) -> str:
+    """Format seconds as SRT timestamp: HH:MM:SS,mmm"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
 def process_single_clip(
@@ -1058,11 +1202,14 @@ def process_single_clip(
     background_position: str = "bottom",
     enable_captions: bool = False,
     job_id: str = "",
+    transcript_segments: Optional[List[Dict[str, Any]]] = None,
+    segment_offset: float = 0.0,
 ) -> Dict[str, Any]:
     """Cut, reframe, and encode a single clip. Uploads to R2.
 
     If has_webcam is None, auto-detects webcam presence from the video.
     When webcam is detected: webcam goes on TOP, gameplay goes on BOTTOM.
+    If enable_captions and transcript_segments are provided, burns captions.
     """
 
     # Auto-detect webcam if not specified
@@ -1076,11 +1223,26 @@ def process_single_clip(
     output_path = str(output_dir / f"clip_{clip_id}.mp4")
 
     duration = max(0.1, end_time - start_time)
+
+    # Generate SRT for captions if enabled and transcript segments available
+    srt_path = ""
+    if enable_captions and transcript_segments:
+        # The transcript segments have timestamps relative to the ORIGINAL VOD.
+        # The downloaded segment starts at segment_offset in the VOD.
+        # The clip starts at start_time within the downloaded segment.
+        # So the clip's VOD time range is: (start_time + segment_offset) to (end_time + segment_offset)
+        vod_start = start_time + segment_offset
+        vod_end = end_time + segment_offset
+        srt_path = _generate_clip_srt(
+            transcript_segments, vod_start, vod_end, segment_offset, job_id,
+        )
+
     filter_str = _build_reframe_filter(
         has_webcam=has_webcam,
         webcam_position=webcam_position,
         background_position=background_position,
         enable_captions=enable_captions,
+        srt_path=srt_path,
     )
 
     cmd = [
@@ -1105,6 +1267,13 @@ def process_single_clip(
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=540)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {result.stderr[-3000:]}")
+
+    # Clean up SRT file
+    if srt_path:
+        try:
+            os.unlink(srt_path)
+        except OSError:
+            pass
 
     # Upload to R2
     r2_client, bucket = _get_r2_client()
@@ -1382,6 +1551,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   clip_count INTEGER DEFAULT 0,
   clips_json TEXT,
   analysis_json TEXT,
+  segments_json TEXT,
   error TEXT,
   created_at REAL,
   updated_at REAL
@@ -1470,7 +1640,7 @@ class JobStore:
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         d = dict(row)
-        for key in ("clips_json", "analysis_json"):
+        for key in ("clips_json", "analysis_json", "segments_json"):
             if d.get(key):
                 try:
                     d[key.replace("_json", "")] = json.loads(d[key])
@@ -1578,6 +1748,7 @@ def _run_pipeline_background(job_id: str, source_url: str, transcript: str, refr
             progress=100,
             clip_count=len(clips),
             analysis_json=json.dumps(moments),
+            segments_json=json.dumps(segments),
         )
     except Exception as e:
         job_store.update(job_id, status="failed", error=str(e), progress=0)
@@ -1591,28 +1762,65 @@ def _run_single_clip_background(
     clip_title: str,
     reframe_config: Optional[Dict],
 ):
-    """Download source, cut a single clip, reframe, upload to R2."""
+    """Download ONLY the clip segment, cut, reframe, upload to R2.
+
+    Uses yt-dlp --download-sections to fetch just the timestamp range
+    instead of downloading the entire VOD. This makes reframing a clip
+    from a 3-hour VOD take ~30s instead of ~10min.
+    """
     try:
         job_store.update(job_id, status="downloading", progress=20)
-        download_result = download_source(url=source_url, job_id=job_id)
+        download_result = download_clip_segment(
+            url=source_url,
+            job_id=job_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
         video_path = download_result["videoPath"]
+        # The downloaded segment starts at segmentOffset in the original VOD.
+        # Adjust start_time to be relative to the downloaded segment.
+        segment_offset = download_result.get("segmentOffset", 0.0)
+        local_start = max(0.0, start_time - segment_offset)
+        local_end = end_time - segment_offset
 
         job_store.update(job_id, status="processing", progress=50)
         rc = reframe_config or {}
         # If user explicitly set webcamPipFirst, use it; otherwise auto-detect (None)
         webcam_setting = rc.get("webcamPipFirst")
         has_webcam = None if webcam_setting is None else bool(webcam_setting)
+
+        # Fetch transcript segments from the parent analysis job for captions
+        transcript_segments = None
+        try:
+            # The reframe job's source_url matches the parent job's source_url.
+            # Find the parent analysis job (completed, has segments_json).
+            all_jobs = job_store.list()
+            for j in all_jobs:
+                if j.get("source_url") == source_url and j.get("segments"):
+                    transcript_segments = j["segments"]
+                    break
+        except Exception:
+            pass
+
         result = process_single_clip(
             video_path=video_path,
-            start_time=start_time,
-            end_time=end_time,
+            start_time=local_start,
+            end_time=local_end,
             clip_title=clip_title,
             has_webcam=has_webcam,
             webcam_position=rc.get("webcamPosition", "top"),
             background_position=rc.get("backgroundPosition", "bottom"),
             enable_captions=rc.get("enableCaptions", False),
             job_id=job_id,
+            transcript_segments=transcript_segments,
+            segment_offset=segment_offset,
         )
+
+        # Clean up the downloaded segment to save disk
+        try:
+            os.unlink(video_path)
+        except OSError:
+            pass
 
         job_store.update(
             job_id,
