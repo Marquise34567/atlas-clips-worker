@@ -426,9 +426,16 @@ def _collect_top_moments(
     used_windows: List[Tuple[float, float]] = []
 
     def _try_add(cand: Dict[str, Any]) -> bool:
+        # _fit_window's max_duration param is the VIDEO duration (upper
+        # bound for end time), NOT the max clip length. We cap clip length
+        # separately below. Passing max_clip_duration here would trap all
+        # clips in the first 60 seconds of the VOD.
         clip_start, clip_end = _fit_window(
-            cand["start"], cand["end"], min_clip_duration, max_clip_duration,
+            cand["start"], cand["end"], min_clip_duration, duration,
         )
+        # Enforce max clip duration
+        if clip_end - clip_start > max_clip_duration:
+            clip_end = clip_start + max_clip_duration
         # Check overlap with existing clips (>5s overlap = skip)
         for ws, we in used_windows:
             overlap = max(0.0, min(clip_end, we) - max(clip_start, ws))
