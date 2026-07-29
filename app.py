@@ -2767,6 +2767,7 @@ def _run_single_clip_background(
     end_time: float,
     clip_title: str,
     reframe_config: Optional[Dict],
+    parent_job_id: str = "",
 ):
     """Download ONLY the clip segment, cut, reframe, upload to R2.
 
