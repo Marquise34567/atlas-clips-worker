@@ -573,17 +573,67 @@ def detect_moments_heuristic(
     }
 
 
+def _generate_heuristic_titles(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Generate titles from clip transcripts without any LLM.
+
+    Picks the most punchy phrase from the transcript (first all-caps reaction,
+    or the shortest sentence with a hook keyword). Falls back to a time-based
+    title if nothing interesting is found.
+    """
+    for i, clip in enumerate(clips):
+        if clip.get("title") and clip["title"] != f"Clip {i+1}":
+            continue
+        text = (clip.get("transcript") or "").strip()
+        title = ""
+        if text:
+            sentences = _re.split(r'[.!?]+', text)
+            # Prefer sentences with hook keywords
+            best = ""
+            best_score = 0
+            for s in sentences:
+                s = s.strip()
+                if not s or len(s) < 3:
+                    continue
+                score = 0
+                low = s.lower()
+                for kw, w in HOOK_KEYWORDS.items():
+                    if kw in low:
+                        score += w
+                # All-caps = excitement
+                if s.isupper() and len(s) < 40:
+                    score += 2.0
+                # Shorter = punchier
+                if len(s) <= 50:
+                    score += 0.5
+                if score > best_score:
+                    best_score = score
+                    best = s
+            if best:
+                # Capitalize and truncate
+                title = best[:60]
+                if len(best) > 60:
+                    title = best[:57].rstrip() + "..."
+                title = title[0].upper() + title[1:] if title else ""
+        if not title:
+            mins = int(clip.get("startTime", 0)) // 60
+            secs = int(clip.get("startTime", 0)) % 60
+            title = f"Highlight at {mins}:{secs:02d}"
+        clip["title"] = title
+        if not clip.get("description"):
+            score = clip.get("viralScore", 0)
+            clip["description"] = f"Viral score {score:.1f}/10" if score else ""
+    return clips
+
+
 def _generate_clip_titles_groq(clips: List[Dict[str, Any]], source_type: str) -> List[Dict[str, Any]]:
     """Use Groq to generate catchy titles + descriptions for heuristic-selected clips.
 
-    This is a SMALL prompt (just the clip transcripts, not the full VOD transcript)
-    so it stays well within token limits. Groq is only used for copywriting, not
-    for moment detection.
+    Groq is OPTIONAL — if the API key is missing or the request fails, falls back
+    to heuristic title generation. The pipeline must NEVER fail because of Groq.
     """
     if not clips:
         return clips
 
-    client = _get_groq_client()
     source_label = {"youtube": "YouTube video", "twitch": "Twitch VOD"}.get(source_type, "video")
 
     # Build a compact prompt with just the clip transcripts
@@ -605,6 +655,7 @@ Return ONLY valid JSON:
 }}"""
 
     try:
+        client = _get_groq_client()  # May raise if GROQ_API_KEY missing — caught below
         completion = client.chat.completions.create(
             messages=[
                 {"role": "system", "content": "You are a viral content title generator. Return only JSON."},
@@ -625,19 +676,52 @@ Return ONLY valid JSON:
             else:
                 clip["title"] = clip.get("title", f"Clip {i+1}")
     except Exception as e:
-        print(f"Groq title generation failed: {e}")
-        for i, clip in enumerate(clips):
-            if not clip.get("title"):
-                clip["title"] = f"Clip {i+1}"
+        print(f"Groq title generation failed (using heuristic fallback): {e}")
+        clips = _generate_heuristic_titles(clips)
 
     return clips
 
 
 def analyze_comments(transcript: str, comments: str = "") -> Dict[str, Any]:
-    """Analyze transcript + comments to recommend the best editing style."""
+    """Analyze transcript + comments to recommend the best editing style.
 
-    client = _get_groq_client()
+    Groq is OPTIONAL — falls back to a heuristic style detector if Groq is
+    unavailable so the endpoint never 500s.
+    """
     comments_text = comments or "No specific comments provided"
+
+    # Heuristic fallback: score styles based on keyword density in transcript
+    def _heuristic_style() -> Dict[str, Any]:
+        low = (transcript or "").lower()
+        reaction_score = 0
+        retention_score = 0
+        commentary_score = 0
+        for kw, w in HOOK_KEYWORDS.items():
+            if kw in low:
+                reaction_score += w * 10
+                retention_score += w * 8
+        # Commentary: longer sentences, educational keywords
+        for kw in ["how to", "tutorial", "explain", "learn", "guide", "step by step", "why", "because"]:
+            if kw in low:
+                commentary_score += 20
+        # Normalize to 0-100
+        mx = max(reaction_score, retention_score, commentary_score, 1)
+        return {
+            "detectedStyle": "reaction" if reaction_score == mx else ("commentary" if commentary_score == mx else "retention"),
+            "confidence": min(95, int(60 + mx / 10)),
+            "reasoning": "Heuristic analysis based on keyword density (Groq unavailable).",
+            "styleRecommendations": {
+                "retention": {"score": min(100, int(retention_score / mx * 100)), "reasoning": "Fast-paced content detected."},
+                "commentary": {"score": min(100, int(commentary_score / mx * 100)), "reasoning": "Educational content detected."},
+                "reaction": {"score": min(100, int(reaction_score / mx * 100)), "reasoning": "Emotional reactions detected."},
+            },
+        }
+
+    try:
+        client = _get_groq_client()
+    except Exception as e:
+        print(f"Groq unavailable for comment analysis (using heuristic): {e}")
+        return _heuristic_style()
 
     prompt = f"""Analyze this video transcript and any viewer comments to determine the best editing style for vertical short-form content.
 
@@ -666,22 +750,25 @@ Return only valid JSON in this exact format:
   }}
 }}"""
 
-    completion = client.chat.completions.create(
-        messages=[
-            {
-                "role": "system",
-                "content": "You are an expert video editor and content strategist who analyzes video content and viewer engagement to recommend the best editing style for short-form vertical videos.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        model=GROQ_QUALITY_MODEL,
-        temperature=0.7,
-        max_tokens=2000,
-        response_format={"type": "json_object"},
-    )
-
-    text = completion.choices[0].message.content or "{}"
-    return json.loads(text)
+    try:
+        completion = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert video editor and content strategist who analyzes video content and viewer engagement to recommend the best editing style for short-form vertical videos.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            model=GROQ_QUALITY_MODEL,
+            temperature=0.7,
+            max_tokens=2000,
+            response_format={"type": "json_object"},
+        )
+        text = completion.choices[0].message.content or "{}"
+        return json.loads(text)
+    except Exception as e:
+        print(f"Groq comment analysis failed (using heuristic): {e}")
+        return _heuristic_style()
 
 
 def download_source(url: str, job_id: str) -> Dict[str, Any]:
@@ -1025,29 +1112,41 @@ def transcribe_audio(audio_path: str, duration: float = 0) -> List[Dict[str, Any
         return segments
 
     # Fallback: Groq Whisper (has 25MB file size limit, returns text only)
-    client = _get_groq_client()
+    # Groq is OPTIONAL — if the key is missing or the request fails, return
+    # empty segments so the heuristic detector runs on whatever text we have.
+    try:
+        client = _get_groq_client()
+    except Exception as e:
+        print(f"Groq Whisper fallback skipped (no key): {e}")
+        return []
+
     file_size = os.path.getsize(audio_path)
     MAX_SIZE = 24 * 1024 * 1024  # 24MB safety margin
 
     if file_size <= MAX_SIZE:
-        with open(audio_path, "rb") as f:
-            resp = client.audio.transcriptions.create(
-                model="whisper-large-v3-turbo",
-                file=f,
-                response_format="verbose_json",
-            )
-        # Groq returns a parsed object, convert to dicts
-        segments = []
-        if hasattr(resp, "segments") and resp.segments:
-            for seg in resp.segments:
-                segments.append({
-                    "start": getattr(seg, "start", 0),
-                    "end": getattr(seg, "end", 0),
-                    "text": getattr(seg, "text", "").strip(),
-                })
-        return segments
+        try:
+            with open(audio_path, "rb") as f:
+                resp = client.audio.transcriptions.create(
+                    model="whisper-large-v3-turbo",
+                    file=f,
+                    response_format="verbose_json",
+                )
+            # Groq returns a parsed object, convert to dicts
+            segments = []
+            if hasattr(resp, "segments") and resp.segments:
+                for seg in resp.segments:
+                    segments.append({
+                        "start": getattr(seg, "start", 0),
+                        "end": getattr(seg, "end", 0),
+                        "text": getattr(seg, "text", "").strip(),
+                    })
+            return segments
+        except Exception as e:
+            print(f"Groq Whisper transcription failed: {e}")
+            return []
 
-    # Groq fallback with no segments: return empty (Speaches should be configured)
+    # File too large for Groq Whisper and Speaches unavailable
+    print("No transcription available (Speaches down, file too large for Groq Whisper)")
     return []
 
 
