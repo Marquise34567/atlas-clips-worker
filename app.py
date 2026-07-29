@@ -110,47 +110,76 @@ def _get_r2_client():
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Atlas Heuristic Moment Detection (ported from backend/autoeditor.py)
-# Text-only scoring: keyword, intrigue, structural, sentiment, sentiment_spike
-# No video file needed — works on transcript segments alone
+# Atlas Smart Moments — efficient best-moment finder for long VODs
+# Text-only scoring with windowed grouping, emotional energy detection,
+# and temporal diversity spreading. Finds great moments ANYWHERE in the
+# video, not just the opening. Mixes Atlas heuristic concepts (keyword
+# lift, sentiment spike, structural features) with energy/burst detection.
 # ---------------------------------------------------------------------------
 
 import math
 import re as _re
 
+# ── Trigger keywords (gaming / streaming / general viral) ──────────────────
+# Weight = how strongly this word signals an exciting moment.
 HOOK_KEYWORDS: Dict[str, float] = {
-    "wtf": 1.8, "shocking": 1.6, "unbelievable": 1.4, "no way": 1.3,
-    "plot twist": 1.5, "insane": 1.4, "crazy": 1.3, "wild": 1.2,
-    "unexpected": 1.1, "funny": 1.1, "funniest": 1.2, "hilarious": 1.2,
-    "lol": 0.9, "laugh": 0.9, "laughing": 1.0, "scary": 1.2,
-    "terrifying": 1.3, "creepy": 1.0, "spooky": 0.9, "emotional": 1.2,
-    "heartbreaking": 1.4, "sad": 1.0, "cry": 1.0, "crying": 1.1,
-    "happy": 1.0, "joy": 1.0, "exciting": 1.1, "excited": 1.0,
-    "amazing": 1.1, "incredible": 1.2, "goosebumps": 1.2, "omg": 1.3,
-    "let's go": 1.2, "clutch": 1.1, "play": 0.8, "play of the game": 1.6,
-    "play of the game": 1.6, "potg": 1.5, "highlight": 1.0,
-    "comeback": 1.3, "destroyed": 1.1, "wiped": 1.0, "rage": 1.2,
-    "screaming": 1.1, "freaking out": 1.2, "broken": 1.0, "glitch": 0.9,
-    "speedrun": 1.0, "world record": 1.5, "wr": 1.3, "pb": 1.0,
-    "personal best": 1.1, "ranked": 0.8, "tier": 0.7, "champion": 1.0,
-    "winner": 1.0, "victory": 1.1, "defeat": 0.9, "boss": 0.8,
-    "level up": 0.9, "achievement": 0.9, "unlock": 0.8,
+    # Extreme reactions (highest signal)
+    "wtf": 2.0, "holy shit": 2.0, "oh my god": 1.8, "omg": 1.6, "omfg": 2.0,
+    "no way": 1.6, "no shot": 1.6, "you're kidding": 1.5, "are you serious": 1.5,
+    "i can't believe": 1.5, "unbelievable": 1.5, "this is insane": 1.6,
+    # Excitement / hype
+    "insane": 1.4, "crazy": 1.2, "wild": 1.1, "nuts": 1.1, "unreal": 1.3,
+    "absurd": 1.0, "ridiculous": 1.0, "stupid": 0.8, "cracked": 1.3,
+    "broken": 1.0, "overpowered": 1.0, "op": 0.8, "god mode": 1.4,
+    # Gaming highlights
+    "clutch": 1.4, "play of the game": 1.8, "potg": 1.6, "highlight": 1.0,
+    "comeback": 1.4, "destroyed": 1.2, "wiped": 1.0, "dominated": 1.1,
+    "speedrun": 1.2, "world record": 1.8, "wr": 1.5, "pb": 1.2,
+    "personal best": 1.3, "ranked": 0.7, "champion": 1.0, "winner": 1.0,
+    "victory": 1.1, "defeat": 0.9, "boss": 0.8, "level up": 0.8,
+    "achievement": 0.9, "ace": 1.4, "triple kill": 1.5, "quad": 1.3,
+    "pentakill": 1.8, "headshot": 1.2, "sniped": 1.0, "flick": 1.1,
+    # Emotion
+    "hilarious": 1.3, "funniest": 1.4, "laughing": 1.1, "lol": 0.9,
+    "lmao": 1.1, "lmfao": 1.3, "haha": 0.8, "scary": 1.1,
+    "terrifying": 1.3, "emotional": 1.2, "heartbreaking": 1.4,
+    "crying": 1.1, "tears": 1.0, "rage": 1.3, "angry": 1.0,
+    "furious": 1.2, "freaking out": 1.3, "screaming": 1.2,
+    # Discovery / achievement
+    "amazing": 1.1, "incredible": 1.2, "goosebumps": 1.3,
+    "let's go": 1.3, "let me go": 1.0, "finally": 1.0,
+    "first time": 0.9, "never seen": 1.1, "brand new": 0.8,
+    # Drama / controversy
+    "drama": 1.2, "exposed": 1.3, "controversy": 1.2, "beef": 1.0,
+    "called out": 1.1, "confrontation": 1.0, "argument": 0.9,
 }
 
+# Curiosity / cliffhanger words (lower weight — useful but not primary signal)
 CLIFFHANGER_KEYWORDS: Dict[str, float] = {
-    "next": 1.4, "part 2": 1.6, "to be continued": 1.8, "stay tuned": 1.4,
-    "but then": 1.2, "not over": 1.4, "coming up": 1.2, "mystery": 1.3,
-    "unfinished": 1.5, "wait": 0.8, "hold on": 1.0, "actually": 0.7,
+    "but then": 1.0, "not over": 1.0, "coming up": 0.9, "mystery": 1.0,
+    "wait": 0.7, "hold on": 0.8, "actually": 0.5, "look at this": 1.0,
+    "did you see": 1.0, "watch this": 1.1, "check this out": 1.0,
+    "you won't believe": 1.2, "here's the thing": 0.8,
+}
+
+# Filler / low-value words (penalize — these indicate dead air)
+FILLER_WORDS: set = {
+    "um", "uh", "like", "you know", "i mean", "basically", "literally",
+    "sort of", "kind of", "whatever", "anyway", "so yeah", "i guess",
 }
 
 _SENTENCE_END_RE = _re.compile(r"[.!?…]+[\"')\]]*$")
+_CAPS_RE = _re.compile(r"\b[A-Z]{3,}\b")
+_PROFANITY_RE = _re.compile(r"\b(fuck|shit|damn|bitch|ass|hell)\b", _re.IGNORECASE)
 
 _POS_WORDS = ["great", "amazing", "love", "best", "awesome", "wow", "funny",
               "happy", "incredible", "perfect", "beautiful", "fantastic",
-              "brilliant", "legendary", "epic", "god", "goat", "insane"]
+              "brilliant", "legendary", "epic", "god", "goat", "insane",
+              "cracked", "unreal", "pog", "poggers", "let's go", "hype"]
 _NEG_WORDS = ["hate", "worst", "bad", "awful", "scared", "angry", "sad",
               "terrible", "horrible", "disgusting", "stupid", "dumb",
-              "broken", "trash", "garbage", "cringe", "fail"]
+              "broken", "trash", "garbage", "cringe", "fail", "ruined",
+              "rigged", "bs", "bullshit"]
 
 
 def _ends_sentence(text: str) -> bool:
@@ -162,6 +191,8 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 
 def _rule_based_sentiment(text: str) -> float:
+    """Sentiment in range [-1, 1]. Both strong positive AND strong negative
+    indicate an engaging moment — we care about intensity, not polarity."""
     lowered = text.lower()
     pos = sum(1 for w in _POS_WORDS if w in lowered)
     neg = sum(1 for w in _NEG_WORDS if w in lowered)
@@ -175,12 +206,22 @@ def _text_features(text: str) -> Tuple[float, float, float]:
     lowered = text.lower()
     hook_score = sum(weight for key, weight in HOOK_KEYWORDS.items() if key in lowered)
     intrigue_score = sum(weight for key, weight in CLIFFHANGER_KEYWORDS.items() if key in lowered)
-    punctuation_boost = lowered.count("?") * 0.22 + lowered.count("!") * 0.16
-    uppercase_boost = 0.4 if _re.search(r"\b[A-Z]{3,}\b", text) else 0.0
+    # Punctuation energy: questions and exclamations signal engagement
+    punctuation_boost = lowered.count("?") * 0.25 + lowered.count("!") * 0.20
+    # ALL CAPS words = shouting / excitement
+    caps_count = len(_CAPS_RE.findall(text))
+    uppercase_boost = min(1.2, caps_count * 0.35)
+    # Profanity often correlates with high-emotion moments (gaming streams)
+    profanity_boost = min(0.8, len(_PROFANITY_RE.findall(text)) * 0.3)
+    # Word count — concise punchy segments score higher
     word_count = max(1, len(_re.findall(r"[a-zA-Z']+", text)))
     conciseness = 1.0 / math.sqrt(word_count)
-    sentence_end_bonus = 0.18 if _ends_sentence(text) else 0.0
-    structural = punctuation_boost + uppercase_boost + conciseness + sentence_end_bonus
+    sentence_end_bonus = 0.15 if _ends_sentence(text) else 0.0
+    # Filler penalty — segments full of filler words are dead air
+    filler_count = sum(1 for w in FILLER_WORDS if w in lowered)
+    filler_penalty = filler_count * 0.15
+    structural = (punctuation_boost + uppercase_boost + profanity_boost
+                  + conciseness + sentence_end_bonus - filler_penalty)
     return structural, hook_score, intrigue_score
 
 
@@ -220,28 +261,53 @@ class _SegmentScore:
 
 
 def _score_segments(segments: List[_TranscriptSeg]) -> List[_SegmentScore]:
-    """Score transcript segments using the Atlas heuristic (text-only)."""
+    """Score transcript segments using the Atlas Smart Moments algorithm.
+
+    Scores each segment on:
+    - Keyword density (hook words per word — normalized so short segments
+      with one strong keyword don't dominate over longer rich segments)
+    - Emotional intensity (abs(sentiment) — both positive and negative)
+    - Sentiment spike (sudden shift vs the LOCAL context, not just prev seg)
+    - Structural energy (punctuation, caps, profanity, conciseness)
+    - Intrigue / curiosity hooks
+    - Speech density (words per second — rapid speech = excitement)
+    """
     if not segments:
         return []
 
-    sentiments: List[float] = []
-    for seg in segments:
-        sentiments.append(_rule_based_sentiment(seg.text))
+    # Pre-compute sentiments
+    sentiments = [_rule_based_sentiment(seg.text) for seg in segments]
 
-    # Text weight is high since we have no video/audio features
-    text_weight = 1.15
     out: List[_SegmentScore] = []
     for idx, seg in enumerate(segments):
         structural, keyword, intrigue = _text_features(seg.text)
         sentiment = sentiments[idx]
-        prev_sent = sentiments[idx - 1] if idx > 0 else 0.0
-        sentiment_spike = abs(sentiment - prev_sent)
+
+        # Local context sentiment spike: compare to a 5-segment window average
+        # This catches genuine emotional shifts, not just adjacent noise.
+        window_start = max(0, idx - 5)
+        window_end = min(len(sentiments), idx + 6)
+        local_avg = sum(sentiments[window_start:window_end]) / max(1, window_end - window_start)
+        sentiment_spike = abs(sentiment - local_avg)
+
+        # Speech density: words per second (rapid speech = high energy)
+        seg_duration = max(0.5, seg.end - seg.start)
+        word_count = max(1, len(_re.findall(r"[a-zA-Z']+", seg.text)))
+        words_per_sec = word_count / seg_duration
+        # Normalize: typical speech is ~2-3 words/sec; >4 = excited
+        density_boost = _clamp((words_per_sec - 2.5) * 0.15, 0.0, 0.6)
+
+        # Keyword density: keywords per word (avoids bias toward long segments)
+        keyword_density = keyword / max(1, word_count) * 10  # scale up
+
         total = (
-            structural * 0.95 * text_weight
-            + keyword * 1.30 * text_weight
-            + intrigue * 0.45 * text_weight
-            + abs(sentiment) * 1.0 * text_weight
-            + sentiment_spike * 1.10 * text_weight
+            structural * 0.80
+            + keyword_density * 1.40
+            + keyword * 0.60        # raw keyword weight still matters
+            + intrigue * 0.35
+            + abs(sentiment) * 1.20  # emotional INTENSITY (either polarity)
+            + sentiment_spike * 1.50  # sudden shifts = engaging
+            + density_boost * 0.50
         )
         out.append(_SegmentScore(
             segment=seg, structural=structural, keyword=keyword,
@@ -258,111 +324,179 @@ def _collect_top_moments(
     min_clip_duration: float = 15.0,
     max_clip_duration: float = 60.0,
 ) -> List[Dict[str, Any]]:
-    """Select top viral moments using the Atlas hook candidate algorithm.
+    """Select top viral moments using windowed scoring + diversity spreading.
 
-    Applies opening pressure, keyword lift, emotion lift, and deduplication
-    to avoid overlapping clips.
+    Key differences from the old algorithm:
+    1. NO opening pressure bias — great moments can be anywhere in the VOD.
+    2. Windowed grouping: aggregates nearby segment scores into 15-60s windows
+       so we find complete moments, not just one loud sentence.
+    3. Temporal diversity: spreads clips across the video so we don't cluster
+       all picks in one section. Divides the VOD into zones and picks the best
+       from each zone before filling from the global pool.
+    4. Context-aware sentiment spike: compares to local window, not just prev.
     """
     if not scores:
         return []
 
     duration = max(1e-6, duration)
 
-    def hook_score(row: _SegmentScore) -> float:
-        position = row.segment.start / duration
-        opening_pressure = 0.38 * _clamp((0.28 - position) / 0.28, 0.0, 1.0)
-        first_seconds_bonus = 0.10 if row.segment.start <= 14.0 else 0.0
-        late_penalty = 0.06 if position > 0.90 else 0.0
-        keyword_lift = _clamp(row.keyword * 0.50 + row.intrigue * 0.35, 0.0, 1.8)
-        emotion_lift = _clamp(abs(row.sentiment) * 0.90 + row.sentiment_spike * 1.15, 0.0, 2.8)
-        peak_intensity = _clamp(
-            abs(row.sentiment) * 0.70 + row.sentiment_spike * 0.85,
-            0.0, 2.8,
-        )
-        moment_lift = peak_intensity * 0.35
-        late_moment_boost = 0.35 * _clamp((position - 0.40) / 0.60, 0.0, 1.0) * peak_intensity
-        return (
-            row.total
-            + keyword_lift
-            + emotion_lift
-            + moment_lift
-            + late_moment_boost
-            + opening_pressure
-            + first_seconds_bonus
-            - late_penalty
-        )
+    # ── Step 1: Build candidate windows by grouping nearby segments ────────
+    # Slide through segments and build 15-60s windows, scoring each window
+    # by the aggregate energy of its constituent segments.
+    candidates: List[Dict[str, Any]] = []
+    n = len(scores)
 
-    ranked = sorted(scores, key=hook_score, reverse=True)
-    all_hook_scores = [hook_score(row) for row in scores]
-    max_score = max(all_hook_scores) if all_hook_scores else 1.0
+    for i in range(n):
+        # Build a window starting at segment i, extending up to max_clip_duration
+        window_segs = [scores[i]]
+        window_start = scores[i].segment.start
+        window_end = scores[i].segment.end
+
+        for j in range(i + 1, n):
+            seg = scores[j]
+            if seg.segment.start - window_start > max_clip_duration:
+                break
+            window_segs.append(seg)
+            window_end = seg.segment.end
+
+        window_duration = window_end - window_start
+        if window_duration < 2.0:
+            continue
+
+        # Score the window: sum of segment scores, normalized by duration.
+        # Weight recent (later) segments in the window slightly higher since
+        # the "punchline" of a moment often comes at the end.
+        total_score = 0.0
+        for k, ws in enumerate(window_segs):
+            weight = 1.0 + k * 0.05  # slight ramp
+            total_score += ws.total * weight
+
+        # Normalize by window duration so we don't bias toward long windows
+        normalized = total_score / max(1.0, window_duration)
+
+        # Bonus for windows that hit the sweet spot of 20-45s (ideal clip length)
+        length_bonus = 0.0
+        if 20 <= window_duration <= 45:
+            length_bonus = 0.15
+        elif 15 <= window_duration <= 60:
+            length_bonus = 0.05
+
+        # Penalty for very short windows (likely just one word)
+        if window_duration < 5:
+            normalized *= 0.5
+
+        final_score = normalized + length_bonus
+
+        # Collect aggregate features for categorization
+        best_seg = max(window_segs, key=lambda s: s.total)
+        avg_sentiment = sum(s.sentiment for s in window_segs) / len(window_segs)
+        max_spike = max(s.sentiment_spike for s in window_segs)
+        total_keyword = sum(s.keyword for s in window_segs)
+        total_intrigue = sum(s.intrigue for s in window_segs)
+
+        candidates.append({
+            "start": max(0.0, window_start - 1.0),
+            "end": min(duration, window_end + 1.0),
+            "score": final_score,
+            "best_seg": best_seg,
+            "avg_sentiment": avg_sentiment,
+            "max_spike": max_spike,
+            "total_keyword": total_keyword,
+            "total_intrigue": total_intrigue,
+            "transcript": " ".join(s.segment.text for s in window_segs[:5])[:200],
+        })
+
+    if not candidates:
+        return []
+
+    # ── Step 2: Sort by score ──────────────────────────────────────────────
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+
+    # ── Step 3: Diversity spreading ────────────────────────────────────────
+    # Divide the VOD into `max_count` equal zones. Pick the best candidate
+    # from each zone first, then fill remaining slots from the global pool.
+    # This ensures clips are spread across the entire video.
+    zone_size = duration / max(1, max_count)
+    zones: List[List[Dict[str, Any]]] = [[] for _ in range(max_count)]
+    for c in candidates:
+        zone_idx = min(max_count - 1, int(c["start"] / zone_size))
+        zones[zone_idx].append(c)
 
     chosen: List[Dict[str, Any]] = []
     used_windows: List[Tuple[float, float]] = []
 
-    for row in ranked:
-        # Fit to a 15-60 second clip window
+    def _try_add(cand: Dict[str, Any]) -> bool:
         clip_start, clip_end = _fit_window(
-            row.segment.start - 2.0,
-            row.segment.end + 3.0,
-            min_clip_duration,
-            max_clip_duration,
+            cand["start"], cand["end"], min_clip_duration, max_clip_duration,
         )
-        clip_start = max(0.0, clip_start)
-        clip_end = min(duration, clip_end)
+        # Check overlap with existing clips (>5s overlap = skip)
+        for ws, we in used_windows:
+            overlap = max(0.0, min(clip_end, we) - max(clip_start, ws))
+            if overlap >= 5.0:
+                return False
+        used_windows.append((clip_start, clip_end))
 
-        # Deduplicate: skip if overlaps > 5s with an existing clip
-        overlaps = [
-            max(0.0, min(clip_end, end) - max(clip_start, start))
-            for start, end in used_windows
-        ]
-        if any(x >= 5.0 for x in overlaps):
-            continue
+        best = cand["best_seg"]
+        raw = cand["score"]
+        max_score = candidates[0]["score"] if candidates else 1.0
+        viral_score = int(_clamp((raw / max(max_score, 0.01)) * 100, 30, 99))
+
+        # Categorize based on dominant feature
+        if cand["total_keyword"] > 2.0:
+            category = "funny"
+        elif abs(cand["avg_sentiment"]) > 0.4:
+            category = "emotional_peak"
+        elif cand["max_spike"] > 0.4:
+            category = "controversial"
+        elif cand["total_intrigue"] > 1.0:
+            category = "cliffhanger"
+        else:
+            category = "highlight"
 
         # Build reason string
         reason_bits = []
-        if row.segment.start <= 14.0:
-            reason_bits.append("high opening-hook pressure")
-        if row.keyword > 0.9:
-            reason_bits.append("strong surprise/humor language")
-        if row.sentiment_spike > 0.45:
+        if cand["total_keyword"] > 1.5:
+            reason_bits.append("strong hype/excitement language")
+        if cand["max_spike"] > 0.4:
             reason_bits.append("sharp emotional shift")
-        if abs(row.sentiment) > 0.5:
+        if abs(cand["avg_sentiment"]) > 0.4:
             reason_bits.append("strong emotional tone")
-        if row.intrigue > 0.8:
-            reason_bits.append("cliffhanger/curiosity hook")
-
-        # Normalize viral score to 0-100
-        raw = hook_score(row)
-        viral_score = int(_clamp((raw / max_score) * 100, 30, 99))
-
-        # Determine category
-        if row.keyword > 1.5:
-            category = "funny"
-        elif abs(row.sentiment) > 0.5:
-            category = "emotional_peak"
-        elif row.intrigue > 0.8:
-            category = "cliffhanger"
-        elif row.sentiment_spike > 0.45:
-            category = "controversial"
-        else:
-            category = "hook"
+        if cand["total_intrigue"] > 1.0:
+            reason_bits.append("curiosity/cliffhanger hook")
+        if not reason_bits:
+            reason_bits.append("high engagement potential")
 
         chosen.append({
             "startTime": round(clip_start, 2),
             "endTime": round(clip_end, 2),
             "title": "",  # Will be filled by Groq
-            "description": " ".join(reason_bits) if reason_bits else "high engagement potential",
+            "description": " ".join(reason_bits),
             "viralScore": viral_score,
             "category": category,
-            "transcript": row.segment.text[:200],
-            "triggeredBy": "atlas_heuristic",
+            "transcript": cand["transcript"],
+            "triggeredBy": "atlas_smart_moments",
             "recommendedStyle": "retention",
             "_hookScore": round(raw, 3),
         })
-        used_windows.append((clip_start, clip_end))
+        return True
+
+    # Phase 1: Pick best from each zone (ensures temporal spread)
+    for zone in zones:
         if len(chosen) >= max_count:
             break
+        for cand in zone:  # already sorted by score within zone
+            if _try_add(cand):
+                break
 
+    # Phase 2: Fill remaining slots from global pool (highest score first)
+    if len(chosen) < max_count:
+        for cand in candidates:
+            if len(chosen) >= max_count:
+                break
+            _try_add(cand)
+
+    # Sort chosen clips by start time (natural viewing order)
+    chosen.sort(key=lambda c: c["startTime"])
     return chosen
 
 
@@ -419,8 +553,9 @@ def detect_moments_heuristic(
 
     summary = (
         f"Analyzed {len(transcript_segs)} transcript segments over {video_duration:.0f}s. "
-        f"Atlas heuristic scored {len(scores)} segments, selected top {len(clips)} moments "
-        f"by hook score (keyword lift, sentiment spike, opening pressure, emotion)."
+        f"Atlas Smart Moments scored {len(scores)} segments, selected top {len(clips)} moments "
+        f"using windowed grouping + temporal diversity spreading (keyword density, emotional "
+        f"intensity, sentiment spikes, speech energy)."
     )
 
     return {
