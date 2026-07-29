@@ -263,6 +263,85 @@ def _fit_window(start: float, end: float, min_duration: float, max_duration: flo
     return start, end
 
 
+# ── Substance checks: ensure clips have real content, not just loud moments ──
+
+# Minimum words a clip must contain to have "substance" — a 15-60s clip of
+# someone talking should have at least this many words. Below this it's
+# mostly dead air or a single word reaction with no context.
+MIN_WORDS_PER_CLIP = 20
+
+# Context lead-in: seconds of extra footage before the hook moment so the
+# viewer has context for what's happening. A clip that starts mid-reaction
+# with no setup is confusing and lacks substance.
+CONTEXT_LEAD_IN = 2.0
+
+
+def _snap_to_sentence_boundary(
+    clip_start: float, clip_end: float, scores: List["_SegmentScore"]
+) -> Tuple[float, float]:
+    """Adjust clip start/end to the nearest sentence boundaries in the transcript.
+
+    This prevents clips from cutting off mid-sentence — a clip that starts or
+    ends in the middle of a word feels incomplete and lacks substance. By
+    snapping to sentence boundaries (segments that end with . ! or ?) we
+    ensure each clip contains complete thoughts.
+    """
+    if not scores:
+        return clip_start, clip_end
+
+    # Find the segment whose start is closest to (and <=) clip_start
+    # and snap the clip start to that segment's start if it's a sentence start
+    best_start = clip_start
+    for s in scores:
+        if s.segment.start <= clip_start and s.segment.start > best_start - 5.0:
+            # Prefer starting at a segment that begins a new sentence
+            # (previous segment ended with punctuation, or this is the first)
+            best_start = s.segment.start
+        if s.segment.start > clip_start:
+            break
+
+    # Find the segment whose end is closest to (and >=) clip_end
+    # and snap the clip end to that segment's end if it ends a sentence
+    best_end = clip_end
+    for s in scores:
+        if s.segment.end >= clip_end and s.segment.end < best_end + 5.0:
+            if _ends_sentence(s.segment.text):
+                best_end = s.segment.end
+        if s.segment.end > clip_end + 10.0:
+            break
+
+    # Ensure we don't make the clip too short or too long after snapping
+    if best_end - best_start < 5.0:
+        return clip_start, clip_end
+    return best_start, best_end
+
+
+def _count_words_in_range(
+    start: float, end: float, scores: List["_SegmentScore"]
+) -> int:
+    """Count the total words spoken in a time range. Used to check content
+    density — a clip with too few words is mostly dead air."""
+    total = 0
+    for s in scores:
+        if s.segment.end <= start or s.segment.start >= end:
+            continue
+        total += len(_re.findall(r"[a-zA-Z']+", s.segment.text))
+    return total
+
+
+def _has_complete_thought(
+    start: float, end: float, scores: List["_SegmentScore"]
+) -> bool:
+    """Check if the clip contains at least one complete sentence (a segment
+    ending with . ! or ?). A clip with no complete sentence is just a
+    fragment — a reaction or interjection with no substance."""
+    for s in scores:
+        if s.segment.start >= start and s.segment.end <= end:
+            if _ends_sentence(s.segment.text):
+                return True
+    return False
+
+
 @dataclass
 class _TranscriptSeg:
     start: float
@@ -455,8 +534,33 @@ def _collect_top_moments(
         total_keyword = sum(s.keyword for s in window_segs)
         total_intrigue = sum(s.intrigue for s in window_segs)
 
+        # Context lead-in: start the clip slightly before the hook moment
+        # so the viewer has context for what's happening. Without this, clips
+        # start mid-reaction and feel disconnected.
+        clip_candidate_start = max(0.0, window_start - CONTEXT_LEAD_IN)
+
+        # Content density: count words in the window to check substance
+        word_count_in_window = sum(
+            len(_re.findall(r"[a-zA-Z']+", s.segment.text)) for s in window_segs
+        )
+
+        # Substance penalty: windows with too few words are mostly dead air.
+        # A 15-60s clip should have at least MIN_WORDS_PER_CLIP words to have
+        # real content. Penalize (don't exclude) so short-but-punchy reactions
+        # can still surface, but lower their rank.
+        substance_penalty = 0.0
+        if word_count_in_window < MIN_WORDS_PER_CLIP:
+            substance_penalty = -0.3 * (1.0 - word_count_in_window / MIN_WORDS_PER_CLIP)
+
+        # Completeness bonus: windows that contain at least one complete
+        # sentence (ending with . ! or ?) have a complete thought = substance.
+        has_complete = any(_ends_sentence(s.segment.text) for s in window_segs)
+        completeness_bonus = 0.15 if has_complete else 0.0
+
+        final_score += substance_penalty + completeness_bonus
+
         candidates.append({
-            "start": max(0.0, window_start - 1.0),
+            "start": clip_candidate_start,
             "end": min(duration, window_end + 1.0),
             "score": final_score,
             "best_seg": best_seg,
@@ -467,6 +571,8 @@ def _collect_top_moments(
             "hook_opening": hook_opening,
             "pacing_score": pacing_score,
             "payoff_ending": payoff_ending,
+            "word_count": word_count_in_window,
+            "has_complete_thought": has_complete,
             "transcript": " ".join(s.segment.text for s in window_segs[:5])[:200],
         })
 
@@ -500,6 +606,20 @@ def _collect_top_moments(
         # Enforce max clip duration
         if clip_end - clip_start > max_clip_duration:
             clip_end = clip_start + max_clip_duration
+
+        # ── Substance: snap to sentence boundaries so clips don't cut off
+        # mid-sentence. This ensures each clip contains complete thoughts.
+        clip_start, clip_end = _snap_to_sentence_boundary(
+            clip_start, clip_end, scores
+        )
+
+        # ── Substance: reject clips with too few words (mostly dead air).
+        # A clip needs real spoken content to have substance.
+        words_in_clip = _count_words_in_range(clip_start, clip_end, scores)
+        if words_in_clip < MIN_WORDS_PER_CLIP // 2:
+            # Too little content — skip this candidate entirely
+            return False
+
         # Check overlap with existing clips (>5s overlap = skip)
         for ws, we in used_windows:
             overlap = max(0.0, min(clip_end, we) - max(clip_start, ws))
@@ -557,6 +677,9 @@ def _collect_top_moments(
             "hookScore": int(_clamp(hook_opening * 25, 0, 99)),
             "pacingScore": int(_clamp(pacing_score * 20 + 30, 0, 99)),
             "payoffScore": int(_clamp(payoff_ending * 30, 0, 99)),
+            # ── Substance metrics ──
+            "wordCount": words_in_clip,
+            "hasCompleteThought": cand.get("has_complete_thought", False),
             "_hookScore": round(raw, 3),
         })
         return True
