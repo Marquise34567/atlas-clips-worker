@@ -1556,16 +1556,16 @@ def _build_reframe_filter(
             f"crop={W}:{H}[stacked]",
         ]
 
-    # Burn captions if enabled and SRT file exists
+    # Burn captions if enabled and ASS file exists
     if enable_captions and srt_path and os.path.exists(srt_path):
-        # Escape the path for ffmpeg filter (colons and backslashes need escaping)
         esc_path = srt_path.replace("\\", "/").replace(":", "\\:")
-        force_style = _caption_force_style(caption_style)
         filters.append(
-            f"[stacked]subtitles='{esc_path}':force_style='{force_style}'[out]"
+            f"[stacked]subtitles='{esc_path}'[out]"
         )
+        print(f"[clip] Burning captions from: {srt_path}")
     else:
         filters.append("[stacked]null[out]")
+        print(f"[clip] No captions: enable={enable_captions}, path={srt_path}")
 
     return ";".join(filters)
 
