@@ -2239,9 +2239,109 @@ def _run_single_clip_background(
         job_store.update(job_id, status="failed", error=str(e), progress=0)
 
 
-# ---------------------------------------------------------------------------
-# Job management endpoints
-# ---------------------------------------------------------------------------
+def _run_download_only_background(
+    job_id: str,
+    source_url: str,
+    start_time: float,
+    end_time: float,
+    clip_title: str,
+):
+    """Download ONLY the clip segment and upload it as-is (no reframe, no captions).
+
+    Uses download_clip_segment to fetch just the timestamp range, then
+    uploads the raw clip to R2 with stream copy (no re-encoding).
+    """
+    try:
+        job_store.update(job_id, status="downloading", progress=30)
+        download_result = download_clip_segment(
+            url=source_url,
+            job_id=job_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        video_path = download_result["videoPath"]
+        segment_offset = download_result.get("segmentOffset", 0.0)
+        local_start = max(0.0, start_time - segment_offset)
+        local_end = end_time - segment_offset
+        duration = max(0.1, local_end - local_start)
+
+        job_store.update(job_id, status="processing", progress=70)
+
+        # Cut the exact clip range with stream copy (no re-encode, very fast)
+        clip_id = str(uuid.uuid4())[:8]
+        output_dir = WORK_DIR / job_id / "clips"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = str(output_dir / f"clip_{clip_id}.mp4")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(local_start),
+            "-i", video_path,
+            "-t", str(duration),
+            "-c", "copy",           # stream copy — no re-encode
+            "-avoid_negative_ts", "make_zero",
+            output_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            # Fallback: re-encode if stream copy fails (codec issues)
+            cmd_fallback = [
+                "ffmpeg", "-y",
+                "-ss", str(local_start),
+                "-i", video_path,
+                "-t", str(duration),
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                "-c:a", "aac",
+                output_path,
+            ]
+            proc2 = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=180)
+            if proc2.returncode != 0:
+                raise RuntimeError(f"ffmpeg cut failed: {proc2.stderr[-300:]}")
+
+        # Upload to R2
+        r2_client, bucket = _get_r2_client()
+        r2_key = f"atlas-clips/{job_id}/clip_{clip_id}.mp4"
+        file_size = os.path.getsize(output_path)
+        with open(output_path, "rb") as f:
+            r2_client.upload_fileobj(
+                f, bucket, r2_key,
+                ExtraArgs={"ContentType": "video/mp4"},
+            )
+
+        # Clean up
+        try:
+            os.remove(output_path)
+            os.unlink(video_path)
+        except OSError:
+            pass
+
+        # Generate presigned URL
+        presigned_url = r2_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": r2_key},
+            ExpiresIn=604800,
+        )
+
+        result = {
+            "clipId": clip_id,
+            "r2Key": r2_key,
+            "publicUrl": presigned_url,
+            "title": clip_title,
+            "startTime": start_time,
+            "endTime": end_time,
+            "duration": duration,
+            "sizeBytes": file_size,
+        }
+
+        job_store.update(
+            job_id,
+            status="completed",
+            progress=100,
+            clip_count=1,
+            clips_json=json.dumps([result]),
+        )
+    except Exception as e:
+        job_store.update(job_id, status="failed", error=str(e), progress=0)
 
 @app.post("/api/atlas-clips/jobs")
 async def create_job(req: CreateJobReq):
@@ -2308,6 +2408,39 @@ async def reframe_clip(job_id: str, req: ReframeClipReq):
             clip.get("endTime", 0),
             clip.get("title", f"Clip {req.clipIndex + 1}"),
             req.reframeConfig,
+        ),
+        daemon=True,
+    )
+    thread.start()
+    return {"id": new_job_id, "status": "pending"}
+
+
+@app.post("/api/atlas-clips/jobs/{job_id}/download")
+async def download_clip(job_id: str, req: ReframeClipReq):
+    """Download a clip as-is (no reframe, no captions, no re-encoding).
+
+    Cuts the clip segment from the source VOD with stream copy and
+    uploads it to R2. Much faster than reframe since there's no encoding.
+    """
+    parent = job_store.get(job_id)
+    if not parent:
+        return JSONResponse({"error": "job_not_found"}, status_code=404)
+    analysis = parent.get("analysis") or {}
+    clips = analysis.get("clips", [])
+    if req.clipIndex < 0 or req.clipIndex >= len(clips):
+        return JSONResponse({"error": "clip_index_out_of_range"}, status_code=400)
+    clip = clips[req.clipIndex]
+
+    new_job_id = str(uuid.uuid4())[:12]
+    job_store.create(new_job_id, source_url=parent.get("source_url", ""))
+    thread = threading.Thread(
+        target=_run_download_only_background,
+        args=(
+            new_job_id,
+            parent.get("source_url", ""),
+            clip.get("startTime", 0),
+            clip.get("endTime", 0),
+            clip.get("title", f"Clip {req.clipIndex + 1}"),
         ),
         daemon=True,
     )
