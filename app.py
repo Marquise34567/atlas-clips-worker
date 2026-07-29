@@ -355,19 +355,55 @@ def download_audio_only(url: str, job_id: str) -> Dict[str, Any]:
 
 
 def transcribe_audio(audio_path: str) -> str:
-    """Transcribe audio with Groq's Whisper Large v3 Turbo (near-real-time).
+    """Transcribe audio using the Speaches faster-whisper service on Railway.
 
-    Groq's Whisper API accepts files up to 25MB. For longer audio we split
-    into 20-minute chunks with ffmpeg, transcribe each, and concatenate.
+    Speaches exposes an OpenAI-compatible /v1/audio/transcriptions endpoint
+    that accepts multipart/form-data with a file and model name. It runs
+    faster-whisper locally — no API costs, no rate limits, no file size
+    constraints like Groq's 25MB limit.
+
+    Falls back to Groq Whisper if SPEACHES_URL is not configured.
     """
-    client = _get_groq_client()
+    speaches_url = os.environ.get("SPEACHES_URL", "").strip().rstrip("/")
+    speaches_key = os.environ.get("SPEACHES_API_KEY", "").strip()
 
-    # Check file size — Groq limit is 25MB
+    if speaches_url:
+        import requests
+        endpoint = f"{speaches_url}/v1/audio/transcriptions"
+        headers = {}
+        if speaches_key:
+            headers["Authorization"] = f"Bearer {speaches_key}"
+
+        model = os.environ.get("SPEACHES_MODEL", "Systran/faster-whisper-tiny")
+
+        with open(audio_path, "rb") as f:
+            files = {"file": (os.path.basename(audio_path), f, "audio/wav")}
+            data = {
+                "model": model,
+                "response_format": "text",
+            }
+            resp = requests.post(
+                endpoint,
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=600,
+            )
+
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Speaches transcription failed (HTTP {resp.status_code}): "
+                f"{resp.text[:500]}"
+            )
+
+        return resp.text.strip() or ""
+
+    # Fallback: Groq Whisper (has 25MB file size limit)
+    client = _get_groq_client()
     file_size = os.path.getsize(audio_path)
     MAX_SIZE = 24 * 1024 * 1024  # 24MB safety margin
 
     if file_size <= MAX_SIZE:
-        # Single-shot transcription
         with open(audio_path, "rb") as f:
             resp = client.audio.transcriptions.create(
                 model="whisper-large-v3-turbo",

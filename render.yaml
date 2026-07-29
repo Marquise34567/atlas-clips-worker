@@ -23,3 +23,9 @@ services:
         value: "2"
       - key: CORS_ORIGINS
         value: "https://www.autoeditor.app,https://autoeditor.app"
+      - key: SPEACHES_URL
+        value: "https://speaches-production-b7ce.up.railway.app"
+      - key: SPEACHES_API_KEY
+        value: "u35g1imq1lc7u0kfjgogv8eetnybuhs1"
+      - key: SPEACHES_MODEL
+        value: "Systran/faster-whisper-tiny"
