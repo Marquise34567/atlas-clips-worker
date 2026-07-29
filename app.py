@@ -300,6 +300,130 @@ def download_source(url: str, job_id: str) -> Dict[str, Any]:
     }
 
 
+def download_audio_only(url: str, job_id: str) -> Dict[str, Any]:
+    """Download only the audio track (fast) for transcription.
+
+    Uses yt-dlp to grab the smallest audio-only stream, then converts to
+    WAV 16kHz mono with ffmpeg — the format Groq Whisper expects.
+    """
+    source_type = _detect_source_type(url)
+    if not source_type:
+        raise ValueError(f"Unsupported URL: {url}")
+
+    cache_dir = WORK_DIR / job_id
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    output_template = str(cache_dir / "audio.%(ext)s")
+
+    cmd = [
+        "yt-dlp",
+        "-f", "bestaudio/best",
+        "--extract-audio",
+        "--audio-format", "wav",
+        "-o", output_template,
+        "--no-playlist",
+        "--no-warnings",
+        url,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"yt-dlp audio failed: {result.stderr[-1500:]}")
+
+    files = list(cache_dir.glob("audio.*"))
+    if not files:
+        raise RuntimeError("Audio download completed but no file found")
+
+    audio_path = str(files[0])
+
+    # Probe duration
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", audio_path],
+        capture_output=True, text=True,
+    )
+    duration = 0.0
+    if probe.returncode == 0:
+        try:
+            duration = float(json.loads(probe.stdout)["format"]["duration"])
+        except (KeyError, ValueError):
+            pass
+
+    return {
+        "audioPath": audio_path,
+        "duration": duration,
+        "sourceType": source_type,
+    }
+
+
+def transcribe_audio(audio_path: str) -> str:
+    """Transcribe audio with Groq's Whisper Large v3 Turbo (near-real-time).
+
+    Groq's Whisper API accepts files up to 25MB. For longer audio we split
+    into 20-minute chunks with ffmpeg, transcribe each, and concatenate.
+    """
+    client = _get_groq_client()
+
+    # Check file size — Groq limit is 25MB
+    file_size = os.path.getsize(audio_path)
+    MAX_SIZE = 24 * 1024 * 1024  # 24MB safety margin
+
+    if file_size <= MAX_SIZE:
+        # Single-shot transcription
+        with open(audio_path, "rb") as f:
+            resp = client.audio.transcriptions.create(
+                model="whisper-large-v3-turbo",
+                file=f,
+                response_format="text",
+            )
+        return resp or ""
+
+    # Split into chunks for large files
+    cache_dir = Path(audio_path).parent
+    chunk_prefix = str(cache_dir / "chunk")
+
+    # Get duration
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", audio_path],
+        capture_output=True, text=True,
+    )
+    total_duration = 0.0
+    if probe.returncode == 0:
+        try:
+            total_duration = float(json.loads(probe.stdout)["format"]["duration"])
+        except (KeyError, ValueError):
+            pass
+
+    # Split into 20-minute chunks
+    chunk_duration = 1200  # 20 minutes
+    num_chunks = max(1, int(total_duration // chunk_duration) + 1)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", audio_path,
+            "-f", "segment", "-segment_time", str(chunk_duration),
+            "-ar", "16000", "-ac", "1",
+            f"{chunk_prefix}_%03d.wav",
+        ],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    chunk_files = sorted(cache_dir.glob("chunk_*.wav"))
+    transcripts = []
+    for cf in chunk_files:
+        try:
+            with open(cf, "rb") as f:
+                resp = client.audio.transcriptions.create(
+                    model="whisper-large-v3-turbo",
+                    file=f,
+                    response_format="text",
+                )
+                transcripts.append(resp or "")
+        except Exception as e:
+            print(f"Transcription chunk failed: {e}")
+        finally:
+            cf.unlink(missing_ok=True)
+
+    return " ".join(transcripts)
+
+
 def _build_reframe_filter(
     has_webcam: bool,
     webcam_position: str = "top",
@@ -796,45 +920,43 @@ class ReframeBatchReq(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _run_pipeline_background(job_id: str, source_url: str, transcript: str, reframe_config: Optional[Dict], fast_mode: bool, max_clips: int):
-    """Run the full pipeline in a background thread, updating the job store."""
+    """Run analysis-only pipeline in a background thread.
+
+    Flow: download audio → transcribe with Groq Whisper → detect moments with Groq LLM.
+    The full video is NOT downloaded here — that only happens when the user
+    clicks "Reframe" on a specific clip (see _run_single_clip_background).
+    """
     try:
-        job_store.update(job_id, status="analyzing", progress=10)
+        # If no transcript was provided, download audio and transcribe.
+        if not transcript or not transcript.strip():
+            job_store.update(job_id, status="downloading", progress=15)
+            audio_result = download_audio_only(url=source_url, job_id=job_id)
+            job_store.update(job_id, status="transcribing", progress=35)
+            transcript = transcribe_audio(audio_result["audioPath"])
+            # Clean up audio file to save disk
+            try:
+                os.unlink(audio_result["audioPath"])
+            except OSError:
+                pass
+
+        # Run Groq moment detection on the transcript.
+        job_store.update(job_id, status="analyzing", progress=60)
+        source_type = _detect_source_type(source_url)
         moments = detect_moments(
             transcript=transcript,
-            source_type=_detect_source_type(source_url),
+            video_duration=0,
+            source_type=source_type,
             reframe_config=reframe_config,
             fast_mode=fast_mode,
         )
         clips = moments.get("clips", [])[:max_clips]
-        job_store.update(
-            job_id,
-            status="downloading",
-            progress=25,
-            analysis_json=json.dumps(moments),
-        )
-
-        download_result = download_source(url=source_url, job_id=job_id)
-        video_path = download_result["videoPath"]
-
-        job_store.update(job_id, status="processing", progress=50)
-
-        rc = reframe_config or {}
-        processed = process_batch(
-            video_path=video_path,
-            clips=clips,
-            has_webcam=rc.get("webcamPipFirst", True),
-            webcam_position=rc.get("webcamPosition", "top"),
-            background_position=rc.get("backgroundPosition", "bottom"),
-            enable_captions=rc.get("enableCaptions", False),
-            job_id=job_id,
-        )
 
         job_store.update(
             job_id,
             status="completed",
             progress=100,
-            clip_count=len(processed),
-            clips_json=json.dumps(processed),
+            clip_count=len(clips),
+            analysis_json=json.dumps(moments),
         )
     except Exception as e:
         job_store.update(job_id, status="failed", error=str(e), progress=0)
@@ -1012,3 +1134,143 @@ async def reframe_batch(job_id: str, req: ReframeBatchReq):
         created.append({"id": new_job_id, "status": "pending", "clipIndex": idx})
 
     return {"jobs": created}
+
+
+# ---------------------------------------------------------------------------
+# Chat monitoring endpoints (stubs — prevents 404s from the frontend)
+# ---------------------------------------------------------------------------
+
+# In-memory chat monitoring sessions (not persisted across restarts).
+_chat_sessions: Dict[str, Dict[str, Any]] = {}
+
+
+class ChatMonitorReq(BaseModel):
+    channelId: str
+    triggerPhrases: List[str] = []
+    clipDuration: int = 30
+    autoRecord: bool = False
+
+
+class ChatStopReq(BaseModel):
+    channelId: Optional[str] = None
+
+
+class ChatTriggerReq(BaseModel):
+    channelId: str
+    chatMessage: str
+    timestamp: Optional[float] = None
+    username: Optional[str] = None
+
+
+@app.post("/api/atlas-clips/chat/monitor")
+async def chat_monitor(req: ChatMonitorReq):
+    _chat_sessions[req.channelId] = {
+        "channelId": req.channelId,
+        "triggerPhrases": req.triggerPhrases,
+        "clipDuration": req.clipDuration,
+        "autoRecord": req.autoRecord,
+        "startTime": time.time(),
+        "clipsRecorded": 0,
+        "clips": [],
+        "isMonitoring": True,
+    }
+    return {
+        "status": "monitoring",
+        "channelId": req.channelId,
+        "monitoring": True,
+    }
+
+
+@app.post("/api/atlas-clips/chat/stop")
+async def chat_stop(req: ChatStopReq):
+    clips_recorded = 0
+    if req.channelId:
+        session = _chat_sessions.pop(req.channelId, None)
+        if session:
+            clips_recorded = session.get("clipsRecorded", 0)
+    else:
+        clips_recorded = sum(s.get("clipsRecorded", 0) for s in _chat_sessions.values())
+        _chat_sessions.clear()
+    return {
+        "status": "stopped",
+        "channelId": req.channelId,
+        "clipsRecorded": clips_recorded,
+    }
+
+
+@app.post("/api/atlas-clips/chat/trigger")
+async def chat_trigger(req: ChatTriggerReq):
+    session = _chat_sessions.get(req.channelId)
+    if not session or not session.get("isMonitoring"):
+        return {"status": "not_monitoring", "channelId": req.channelId}
+
+    # Check if message matches any trigger phrase
+    msg_lower = req.chatMessage.lower()
+    matched = any(p.lower() in msg_lower for p in session.get("triggerPhrases", []))
+    if not matched:
+        return {"status": "no_match", "channelId": req.channelId}
+
+    # Create a clip entry
+    clip_duration = session.get("clipDuration", 30)
+    now = req.timestamp or time.time()
+    clip = {
+        "startTime": now,
+        "endTime": now + clip_duration,
+        "title": f"Chat clip by {req.username or 'user'}",
+        "description": f'Triggered by: "{req.chatMessage}"',
+        "viralScore": 50,
+        "category": "chat_reaction",
+        "transcript": req.chatMessage,
+        "chatMessage": req.chatMessage,
+        "triggeredBy": "chat",
+    }
+    session["clips"].append(clip)
+    session["clipsRecorded"] = session.get("clipsRecorded", 0) + 1
+
+    return {
+        "status": "clip_recorded",
+        "channelId": req.channelId,
+        "clip": clip,
+        "autoRecorded": session.get("autoRecord", False),
+    }
+
+
+@app.get("/api/atlas-clips/chat/status/{channel_id}")
+async def chat_status_channel(channel_id: str):
+    session = _chat_sessions.get(channel_id)
+    if not session:
+        return {
+            "status": "not_monitoring",
+            "channelId": channel_id,
+            "isMonitoring": False,
+            "clips": [],
+            "clipsRecorded": 0,
+        }
+    return {
+        "status": "monitoring",
+        "channelId": channel_id,
+        "isMonitoring": True,
+        "startTime": session.get("startTime"),
+        "triggerPhrases": session.get("triggerPhrases", []),
+        "clipDuration": session.get("clipDuration", 30),
+        "autoRecord": session.get("autoRecord", False),
+        "clipsRecorded": session.get("clipsRecorded", 0),
+        "clips": session.get("clips", []),
+    }
+
+
+@app.get("/api/atlas-clips/chat/status")
+async def chat_status_all():
+    return {
+        "status": "ok",
+        "activeChannels": list(_chat_sessions.keys()),
+        "sessions": [
+            {
+                "channelId": s["channelId"],
+                "isMonitoring": s.get("isMonitoring", False),
+                "clipsRecorded": s.get("clipsRecorded", 0),
+                "startTime": s.get("startTime"),
+            }
+            for s in _chat_sessions.values()
+        ],
+    }
