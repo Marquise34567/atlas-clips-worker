@@ -2839,6 +2839,10 @@ def _run_single_clip_background(
         except Exception as e:
             print(f"[reframe {job_id}] Error fetching transcript segments: {e}")
 
+        # NOTE: Reframe step does NOT burn captions — just produces the
+        # 9:16 layout (webcam on top + background on bottom). Captions are
+        # burned at download time when the user picks a caption style and
+        # clicks Download. This makes reframing much faster.
         result = process_single_clip(
             video_path=video_path,
             start_time=local_start,
@@ -2847,7 +2851,7 @@ def _run_single_clip_background(
             has_webcam=has_webcam,
             webcam_position=rc.get("webcamPosition", "top"),
             background_position=rc.get("backgroundPosition", "bottom"),
-            enable_captions=rc.get("enableCaptions", False),
+            enable_captions=False,  # captions burned at download time
             caption_style=rc.get("captionStyle", "white"),
             job_id=job_id,
             transcript_segments=transcript_segments,
@@ -2982,6 +2986,157 @@ def _run_download_only_background(
             clip_count=1,
             clips_json=json.dumps([result]),
         )
+    except Exception as e:
+        job_store.update(job_id, status="failed", error=str(e), progress=0)
+
+
+def _run_burn_captions_background(
+    job_id: str,
+    reframe_url: str,
+    reframe_clip: Dict[str, Any],
+    transcript_segments: List[Dict[str, Any]],
+    caption_style: str,
+    parent_job_id: str,
+):
+    """Download the already-reframed 9:16 video from R2, burn captions in,
+    and upload the final video to R2.
+    
+    This is the second step of the two-step flow:
+    1. Reframe (done) → 9:16 video without captions on R2
+    2. Download (this function) → burn captions → final video on R2
+    """
+    import urllib.request
+    try:
+        job_store.update(job_id, status="downloading", progress=20)
+        
+        # Download the reframed video from R2
+        cache_dir = WORK_DIR / job_id
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        reframe_path = str(cache_dir / "reframed.mp4")
+        print(f"[burn-captions {job_id}] Downloading reframed video from R2...")
+        urllib.request.urlretrieve(reframe_url, reframe_path)
+        
+        # Get the clip's time range from the reframe clip data
+        clip_start = reframe_clip.get("startTime", 0)
+        clip_end = reframe_clip.get("endTime", 0)
+        clip_title = reframe_clip.get("title", "Clip")
+        duration = max(0.1, clip_end - clip_start)
+        
+        # Get the segment offset from the parent job's reframe
+        # The reframed video starts at 0:00, so we need the VOD timestamps
+        # for the transcript segments
+        parent_job = job_store.get(parent_job_id) if parent_job_id else None
+        segment_offset = 0.0
+        # The reframed video is already cut to the clip range, so
+        # captions should use VOD timestamps directly (the ASS file
+        # will use relative times from 0:00 of the reframed video)
+        
+        job_store.update(job_id, status="processing", progress=50)
+        
+        # Generate ASS captions for the clip
+        # The reframed video starts at clip_start in VOD time
+        srt_path = _generate_clip_srt(
+            transcript_segments,
+            clip_start,  # vod_start
+            clip_end,    # vod_end
+            0.0,         # segment_offset = 0 (reframed video starts at 0:00)
+            job_id,
+            caption_style=caption_style,
+        )
+        
+        if not srt_path or not os.path.exists(srt_path):
+            print(f"[burn-captions {job_id}] No captions generated — returning reframed video as-is")
+            # Just upload the reframed video as-is
+            r2_client, bucket = _get_r2_client()
+            r2_key = f"atlas-clips/{job_id}/clip_{str(uuid.uuid4())[:8]}.mp4"
+            with open(reframe_path, "rb") as f:
+                r2_client.upload_fileobj(f, bucket, r2_key, ExtraArgs={"ContentType": "video/mp4"})
+            presigned_url = r2_client.generate_presigned_url(
+                "get_object", Params={"Bucket": bucket, "Key": r2_key}, ExpiresIn=604800)
+            os.unlink(reframe_path)
+            job_store.update(job_id, status="completed", progress=100, clip_count=1,
+                             clips_json=json.dumps([{
+                                 "clipId": str(uuid.uuid4())[:8],
+                                 "r2Key": r2_key, "publicUrl": presigned_url,
+                                 "title": clip_title, "duration": duration,
+                                 "hasCaptions": False,
+                             }]))
+            return
+        
+        print(f"[burn-captions {job_id}] Burning captions with style={caption_style}...")
+        
+        # Burn captions into the reframed video
+        output_path = str(cache_dir / "final.mp4")
+        esc_path = srt_path.replace("\\", "/").replace(":", "\\:")
+        
+        if srt_path.endswith(".ass"):
+            filter_str = f"ass='{esc_path}'"
+        else:
+            filter_str = f"subtitles='{esc_path}'"
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", reframe_path,
+            "-vf", filter_str,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",  # audio is already encoded, just copy
+            "-movflags", "+faststart",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg caption burn failed: {result.stderr[-3000:]}")
+        
+        # Clean up temp files
+        try:
+            os.unlink(reframe_path)
+            os.unlink(srt_path)
+        except OSError:
+            pass
+        
+        # Upload final video to R2
+        job_store.update(job_id, status="uploading", progress=80)
+        r2_client, bucket = _get_r2_client()
+        clip_id = str(uuid.uuid4())[:8]
+        r2_key = f"atlas-clips/{job_id}/clip_{clip_id}.mp4"
+        file_size = os.path.getsize(output_path)
+        with open(output_path, "rb") as f:
+            r2_client.upload_fileobj(f, bucket, r2_key, ExtraArgs={"ContentType": "video/mp4"})
+        
+        # Generate thumbnail
+        thumb_path = str(cache_dir / f"thumb_{clip_id}.jpg")
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", "1", "-i", output_path, "-frames:v", "1",
+             "-vf", "scale=360:640", thumb_path],
+            capture_output=True, timeout=30,
+        )
+        thumb_r2_key = f"atlas-clips/{job_id}/thumb_{clip_id}.jpg"
+        thumb_url = ""
+        if os.path.exists(thumb_path):
+            with open(thumb_path, "rb") as f:
+                r2_client.upload_fileobj(f, bucket, thumb_r2_key, ExtraArgs={"ContentType": "image/jpeg"})
+            thumb_url = r2_client.generate_presigned_url(
+                "get_object", Params={"Bucket": bucket, "Key": thumb_r2_key}, ExpiresIn=604800)
+            os.unlink(thumb_path)
+        
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+        
+        presigned_url = r2_client.generate_presigned_url(
+            "get_object", Params={"Bucket": bucket, "Key": r2_key}, ExpiresIn=604800)
+        
+        job_store.update(job_id, status="completed", progress=100, clip_count=1,
+                         clips_json=json.dumps([{
+                             "clipId": clip_id, "r2Key": r2_key,
+                             "publicUrl": presigned_url, "thumbnailUrl": thumb_url,
+                             "title": clip_title, "duration": duration,
+                             "sizeBytes": file_size, "hasCaptions": True,
+                         }]))
+        print(f"[burn-captions {job_id}] Done! Final video uploaded to R2")
+        
     except Exception as e:
         job_store.update(job_id, status="failed", error=str(e), progress=0)
 
@@ -3311,6 +3466,7 @@ async def reframe_clip(job_id: str, req: ReframeClipReq):
             clip.get("endTime", 0),
             clip.get("title", f"Clip {req.clipIndex + 1}"),
             req.reframeConfig,
+            job_id,
         ),
         daemon=True,
     )
@@ -3318,32 +3474,81 @@ async def reframe_clip(job_id: str, req: ReframeClipReq):
     return {"id": new_job_id, "status": "pending"}
 
 
-@app.post("/api/atlas-clips/jobs/{job_id}/download")
-async def download_clip(job_id: str, req: ReframeClipReq):
-    """Download a clip as-is (no reframe, no captions, no re-encoding).
+class DownloadWithCaptionsReq(BaseModel):
+    """Download a reframed clip with captions burned in.
+    
+    Takes the already-reframed 9:16 video from R2, generates an ASS subtitle
+    file from the transcript segments, burns the captions in, and uploads
+    the final video to R2.
+    """
+    clipIndex: int = 0
+    captionStyle: str = "karaoke"
+    # For manual clips that don't have a clipIndex, use the reframe job ID
+    reframeJobId: Optional[str] = None
 
-    Cuts the clip segment from the source VOD with stream copy and
-    uploads it to R2. Much faster than reframe since there's no encoding.
+
+@app.post("/api/atlas-clips/jobs/{job_id}/download")
+async def download_clip(job_id: str, req: DownloadWithCaptionsReq):
+    """Download a reframed clip with captions burned in.
+    
+    Flow:
+    1. Find the reframe job (either reframeJobId or search for a completed
+       reframe job spawned from this parent job)
+    2. Download the reframed video from R2
+    3. Generate ASS captions from the parent job's transcript segments
+    4. Burn captions into the video with ffmpeg
+    5. Upload the final video to R2
     """
     parent = job_store.get(job_id)
     if not parent:
         return JSONResponse({"error": "job_not_found"}, status_code=404)
-    analysis = parent.get("analysis") or {}
-    clips = analysis.get("clips", [])
-    if req.clipIndex < 0 or req.clipIndex >= len(clips):
+    
+    # Find the reframe job — either explicit or search for it
+    reframe_job_id = req.reframeJobId
+    if not reframe_job_id:
+        # Search for a completed reframe job spawned from this parent
+        all_jobs = job_store.list()
+        for j in all_jobs:
+            if j.get("status") == "completed" and j.get("clips"):
+                # Reframe jobs have clips with publicUrl
+                clips = j.get("clips") or []
+                if clips and clips[0].get("publicUrl"):
+                    reframe_job_id = j.get("id")
+                    break
+    
+    if not reframe_job_id:
+        return JSONResponse({"error": "no_reframe_found", "message": "Reframe the clip first, then download"}, status_code=400)
+    
+    reframe_job = job_store.get(reframe_job_id)
+    if not reframe_job or not reframe_job.get("clips"):
+        return JSONResponse({"error": "reframe_job_has_no_clips"}, status_code=400)
+    
+    reframe_clips = reframe_job["clips"]
+    if req.clipIndex < 0 or req.clipIndex >= len(reframe_clips):
         return JSONResponse({"error": "clip_index_out_of_range"}, status_code=400)
-    clip = clips[req.clipIndex]
-
+    
+    reframe_clip = reframe_clips[req.clipIndex]
+    reframe_url = reframe_clip.get("publicUrl")
+    if not reframe_url:
+        return JSONResponse({"error": "no_reframe_url"}, status_code=400)
+    
+    # Get transcript segments from the parent analysis job
+    transcript_segments = parent.get("segments")
+    if not transcript_segments:
+        return JSONResponse({"error": "no_transcript_segments"}, status_code=400)
+    
     new_job_id = str(uuid.uuid4())[:12]
     job_store.create(new_job_id, source_url=parent.get("source_url", ""))
+    
     thread = threading.Thread(
-        target=_run_download_only_background,
+        target=_run_burn_captions_background,
         args=(
             new_job_id,
-            parent.get("source_url", ""),
-            clip.get("startTime", 0),
-            clip.get("endTime", 0),
-            clip.get("title", f"Clip {req.clipIndex + 1}"),
+            reframe_url,
+            reframe_clip,
+            transcript_segments,
+            req.captionStyle,
+            job_id,  # parent_job_id for segment offset lookup
         ),
         daemon=True,
     )
@@ -3368,6 +3573,7 @@ async def manual_clip(job_id: str, req: ManualClipReq):
             req.endTime,
             req.title or "Manual Clip",
             req.reframeConfig,
+            job_id,
         ),
         daemon=True,
     )
