@@ -915,6 +915,61 @@ def download_clip_segment(
     }
 
 
+def _download_clip_segment_ffmpeg(url, job_id, dl_start, duration, output_path):
+    """Fallback: yt-dlp -g + ffmpeg single-connection seek (slower)."""
+    ytdlp_cmd = [
+        "yt-dlp", "-g",
+        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best",
+        "--no-playlist", "--retries", "3",
+        "--extractor-args", "youtube:player_client=android,ios,web_safari,web",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        url,
+    ]
+    ytdlp_result = subprocess.run(ytdlp_cmd, capture_output=True, text=True, timeout=120)
+    if ytdlp_result.returncode != 0:
+        raise RuntimeError(f"yt-dlp URL fetch failed: {ytdlp_result.stderr[-2000:]}")
+    stream_urls = [u.strip() for u in ytdlp_result.stdout.strip().split('\n') if u.strip()]
+    if not stream_urls:
+        raise RuntimeError("yt-dlp returned no stream URLs")
+    if len(stream_urls) >= 2:
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(dl_start), "-i", stream_urls[0],
+            "-ss", "0", "-i", stream_urls[1],
+            "-t", str(duration), "-c", "copy", "-movflags", "+faststart",
+            output_path,
+        ]
+    else:
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(dl_start), "-i", stream_urls[0],
+            "-t", str(duration), "-c", "copy", "-movflags", "+faststart",
+            output_path,
+        ]
+    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg segment download failed: {result.stderr[-3000:]}")
+    if not os.path.exists(output_path):
+        raise RuntimeError("ffmpeg completed but no output file found")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", output_path],
+        capture_output=True, text=True,
+    )
+    seg_duration = 0.0
+    if probe.returncode == 0:
+        try:
+            seg_duration = float(json.loads(probe.stdout).get("format", {}).get("duration", 0))
+        except Exception:
+            pass
+    return {
+        "videoPath": output_path,
+        "duration": seg_duration,
+        "sourceType": _detect_source_type(url) or "unknown",
+        "sizeBytes": os.path.getsize(output_path),
+        "segmentOffset": dl_start,
+    }
+
+
 def download_audio_only(url: str, job_id: str) -> Dict[str, Any]:
     """Download only the audio track (fast) for transcription.
 
