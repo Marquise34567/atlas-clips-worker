@@ -1344,6 +1344,106 @@ CAPTION_STYLES = {
         "MarginV": 30,
         "Alignment": 2,
     },
+    # ── OpusClip-style animated presets ──────────────────────────────────
+    "neon-pop": {
+        "FontName": "Arial Black",
+        "FontSize": 24,
+        "PrimaryColour": "&HFFFF00&",   # cyan (BGR: 00FFFF)
+        "OutlineColour": "&H000000&",   # black
+        "BorderStyle": 1,
+        "Outline": 2,
+        "Shadow": 3,                    # glow shadow
+        "MarginV": 60,
+        "Alignment": 2,
+    },
+    "word-highlight": {
+        "FontName": "Arial Black",
+        "FontSize": 22,
+        "PrimaryColour": "&HFFFFFF&",   # white
+        "OutlineColour": "&H00FFFF&",   # yellow (BGR: FFFF00)
+        "BorderStyle": 3,               # opaque box for highlight
+        "Outline": 4,
+        "Shadow": 0,
+        "MarginV": 60,
+        "Alignment": 2,
+    },
+    "bouncy": {
+        "FontName": "Arial Black",
+        "FontSize": 24,
+        "PrimaryColour": "&HFFFFFF&",   # white
+        "OutlineColour": "&H000000&",   # black
+        "BorderStyle": 1,
+        "Outline": 4,
+        "Shadow": 2,
+        "MarginV": 80,
+        "Alignment": 2,
+    },
+    "gradient": {
+        "FontName": "Arial Black",
+        "FontSize": 26,
+        "PrimaryColour": "&H00EDFF&",  # orange-yellow gradient feel
+        "OutlineColour": "&H000000&",
+        "BorderStyle": 1,
+        "Outline": 3,
+        "Shadow": 0,
+        "MarginV": 60,
+        "Alignment": 2,
+    },
+    "bold-box": {
+        "FontName": "Arial Black",
+        "FontSize": 22,
+        "PrimaryColour": "&HFFFFFF&",   # white
+        "OutlineColour": "&H000000&",   # black
+        "BorderStyle": 3,               # opaque box
+        "Outline": 0,
+        "Shadow": 0,
+        "MarginV": 60,
+        "Alignment": 2,
+    },
+    "typewriter": {
+        "FontName": "Consolas",
+        "FontSize": 20,
+        "PrimaryColour": "&H00FF00&",   # green (BGR: 00FF00)
+        "OutlineColour": "&H000000&",
+        "BorderStyle": 1,
+        "Outline": 1,
+        "Shadow": 1,
+        "MarginV": 60,
+        "Alignment": 2,
+    },
+    "shake": {
+        "FontName": "Arial Black",
+        "FontSize": 26,
+        "PrimaryColour": "&H5533FF&",   # red (BGR: FF3355)
+        "OutlineColour": "&H000000&",
+        "BorderStyle": 1,
+        "Outline": 5,
+        "Shadow": 0,
+        "MarginV": 60,
+        "Alignment": 2,
+    },
+    "rainbow": {
+        "FontName": "Arial Black",
+        "FontSize": 22,
+        "PrimaryColour": "&HFFFFFF&",   # white (rainbow done via per-word color cycling)
+        "OutlineColour": "&H000000&",
+        "BorderStyle": 1,
+        "Outline": 3,
+        "Shadow": 0,
+        "MarginV": 60,
+        "Alignment": 2,
+    },
+    "outline-glow": {
+        "FontName": "Arial Black",
+        "FontSize": 24,
+        "PrimaryColour": "&HFFFFFF&",   # white
+        "OutlineColour": "&H7C55A8&",   # purple (BGR: A8557C)
+        "BorderStyle": 1,
+        "Outline": 3,
+        "Shadow": 4,                    # thick glow
+        "MarginV": 60,
+        "Alignment": 2,
+    },
 }
 
 
@@ -1469,8 +1569,11 @@ def _generate_clip_srt(
         if seg_duration < 0.1:
             continue
 
-        if caption_style == "tiktok":
-            # Split into word groups of 1-3 words for TikTok-style captions
+        # Styles that benefit from per-word/per-chunk popping animation
+        WORD_POP_STYLES = {"tiktok", "neon-pop", "word-highlight", "bouncy",
+                           "gradient", "shake", "rainbow", "outline-glow", "typewriter"}
+        if caption_style in WORD_POP_STYLES:
+            # Split into word groups of 1-3 words for pop-style captions
             words = text.split()
             if not words:
                 continue
