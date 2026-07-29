@@ -101,7 +101,11 @@ def _get_r2_client():
         endpoint_url=endpoint,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
-        config=BotoConfig(retries={"max_attempts": 5, "mode": "adaptive"}),
+        config=BotoConfig(
+            retries={"max_attempts": 5, "mode": "adaptive"},
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+        ),
     ), bucket
 
 
