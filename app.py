@@ -1861,16 +1861,26 @@ def _build_reframe_filter(
             f"crop={W}:{H}[stacked]",
         ]
 
-    # Burn captions if enabled and ASS file exists
+    # Burn captions if enabled and subtitle file exists
     if enable_captions and srt_path and os.path.exists(srt_path):
         esc_path = srt_path.replace("\\", "/").replace(":", "\\:")
-        filters.append(
-            f"[stacked]subtitles='{esc_path}'[out]"
-        )
-        print(f"[clip] Burning captions from: {srt_path}")
+        # Use ass= filter for .ass files (handles karaoke \kf tags properly),
+        # subtitles= filter for .srt files.
+        if srt_path.endswith(".ass"):
+            filters.append(
+                f"[stacked]ass='{esc_path}'[out]"
+            )
+        else:
+            filters.append(
+                f"[stacked]subtitles='{esc_path}'[out]"
+            )
+        print(f"[clip] Burning captions from: {srt_path} (filter={'ass' if srt_path.endswith('.ass') else 'subtitles'})")
     else:
         filters.append("[stacked]null[out]")
-        print(f"[clip] No captions: enable={enable_captions}, path={srt_path}")
+        if enable_captions:
+            print(f"[clip] CAPTIONS SKIPPED: enable={enable_captions}, path={srt_path}, exists={os.path.exists(srt_path) if srt_path else 'N/A'}")
+        else:
+            print(f"[clip] No captions: enable={enable_captions}")
 
     return ";".join(filters)
 
@@ -2800,22 +2810,30 @@ def _run_single_clip_background(
             else:
                 has_webcam = False
 
-        # Fetch transcript segments from the parent analysis job for captions
+        # Fetch transcript segments for captions — check parent job first,
+        # then fall back to searching all jobs by source_url.
         transcript_segments = None
         try:
-            # The reframe job's source_url matches the parent job's source_url.
-            # Find the parent analysis job (completed, has segments_json).
-            all_jobs = job_store.list()
-            print(f"[reframe {job_id}] Searching {len(all_jobs)} jobs for segments matching {source_url}")
-            for j in all_jobs:
-                jid = j.get("id", "?")
-                jsegs = j.get("segments")
-                jurl = j.get("source_url", "")
-                print(f"[reframe {job_id}]   job={jid} url={jurl[:40]} segs={bool(jsegs)} status={j.get('status')}")
-                if jurl == source_url and jsegs:
-                    transcript_segments = jsegs
-                    print(f"[reframe {job_id}] Found transcript segments from job {jid}: {len(transcript_segments)} segments")
-                    break
+            # Method 1: Direct lookup from parent job (most reliable)
+            if parent_job_id:
+                parent_job = job_store.get(parent_job_id)
+                if parent_job and parent_job.get("segments"):
+                    transcript_segments = parent_job["segments"]
+                    print(f"[reframe {job_id}] Found {len(transcript_segments)} segments from parent job {parent_job_id}")
+
+            # Method 2: Search all jobs by source_url match
+            if not transcript_segments:
+                all_jobs = job_store.list()
+                print(f"[reframe {job_id}] Searching {len(all_jobs)} jobs for segments matching {source_url[:50]}")
+                for j in all_jobs:
+                    jid = j.get("id", "?")
+                    jsegs = j.get("segments")
+                    jurl = j.get("source_url", "")
+                    if jurl and jurl == source_url and jsegs:
+                        transcript_segments = jsegs
+                        print(f"[reframe {job_id}] Found {len(transcript_segments)} segments from job {jid} (url match)")
+                        break
+
             if not transcript_segments:
                 print(f"[reframe {job_id}] WARNING: No transcript segments found - captions will NOT be burned in")
         except Exception as e:
