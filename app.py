@@ -2040,6 +2040,55 @@ def _format_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _generate_thumbnail(video_path: str, job_id: str, clip_id: str, seek_time: float = 1.0) -> str:
+    """Generate a JPEG thumbnail from the video for preview/poster display.
+
+    Extracts a frame at seek_time seconds. Returns the local path to the
+    thumbnail, or empty string if generation fails.
+    """
+    thumb_dir = WORK_DIR / job_id / "thumbs"
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+    thumb_path = str(thumb_dir / f"thumb_{clip_id}.jpg")
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(seek_time),
+            "-i", video_path,
+            "-frames:v", "1",
+            "-q:v", "3",
+            "-vf", "scale=360:640:force_original_aspect_ratio=decrease,pad=360:640:(ow-iw)/2:(oh-ih)/2:black",
+            thumb_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0 and os.path.exists(thumb_path):
+            return thumb_path
+        print(f"[thumb] generation failed: {proc.stderr[-200:]}")
+    except Exception as e:
+        print(f"[thumb] error: {e}")
+    return ""
+
+
+def _upload_thumbnail(thumb_path: str, r2_client, bucket: str, job_id: str, clip_id: str) -> str:
+    """Upload a thumbnail to R2 and return its presigned URL."""
+    if not thumb_path or not os.path.exists(thumb_path):
+        return ""
+    r2_key = f"atlas-clips/{job_id}/thumb_{clip_id}.jpg"
+    with open(thumb_path, "rb") as f:
+        r2_client.upload_fileobj(
+            f, bucket, r2_key,
+            ExtraArgs={"ContentType": "image/jpeg"},
+        )
+    try:
+        os.remove(thumb_path)
+    except OSError:
+        pass
+    return r2_client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": r2_key},
+        ExpiresIn=604800,
+    )
+
+
 def process_single_clip(
     video_path: str,
     start_time: float,
@@ -2155,6 +2204,7 @@ def process_single_clip(
         "-t", str(duration),
         "-filter_complex", filter_str,
         "-map", "[out]",
+        "-map", "0:a?",
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "28",
@@ -2177,6 +2227,9 @@ def process_single_clip(
         except OSError:
             pass
 
+    # Generate thumbnail before uploading (need the local file)
+    thumb_path = _generate_thumbnail(output_path, job_id, clip_id, seek_time=1.0)
+
     # Upload to R2
     r2_client, bucket = _get_r2_client()
     r2_key = f"atlas-clips/{job_id}/clip_{clip_id}.mp4"
@@ -2189,6 +2242,9 @@ def process_single_clip(
             r2_key,
             ExtraArgs={"ContentType": "video/mp4"},
         )
+
+    # Upload thumbnail
+    thumb_url = _upload_thumbnail(thumb_path, r2_client, bucket, job_id, clip_id)
 
     # Clean up local file
     try:
@@ -2208,6 +2264,7 @@ def process_single_clip(
         "clipId": clip_id,
         "r2Key": r2_key,
         "publicUrl": presigned_url,
+        "thumbnailUrl": thumb_url,
         "title": clip_title,
         "startTime": start_time,
         "endTime": end_time,
@@ -2838,6 +2895,7 @@ def _run_download_only_background(
             "-t", str(duration),
             "-c", "copy",           # stream copy — no re-encode
             "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart",
             output_path,
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -2850,11 +2908,15 @@ def _run_download_only_background(
                 "-t", str(duration),
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                 "-c:a", "aac",
+                "-movflags", "+faststart",
                 output_path,
             ]
             proc2 = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=180)
             if proc2.returncode != 0:
                 raise RuntimeError(f"ffmpeg cut failed: {proc2.stderr[-300:]}")
+
+        # Generate thumbnail before upload
+        thumb_path = _generate_thumbnail(output_path, job_id, clip_id, seek_time=1.0)
 
         # Upload to R2
         r2_client, bucket = _get_r2_client()
@@ -2865,6 +2927,9 @@ def _run_download_only_background(
                 f, bucket, r2_key,
                 ExtraArgs={"ContentType": "video/mp4"},
             )
+
+        # Upload thumbnail
+        thumb_url = _upload_thumbnail(thumb_path, r2_client, bucket, job_id, clip_id)
 
         # Clean up
         try:
@@ -2884,6 +2949,7 @@ def _run_download_only_background(
             "clipId": clip_id,
             "r2Key": r2_key,
             "publicUrl": presigned_url,
+            "thumbnailUrl": thumb_url,
             "title": clip_title,
             "startTime": start_time,
             "endTime": end_time,
@@ -3041,6 +3107,7 @@ def _run_montage_background(
                 "-c:a", "aac", "-ar", "44100",
                 "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
                 "-r", "30",
+                "-movflags", "+faststart",
                 seg_path,
             ]
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -3076,6 +3143,7 @@ def _run_montage_background(
                 "-f", "concat", "-safe", "0",
                 "-i", concat_file,
                 "-c", "copy",
+                "-movflags", "+faststart",
                 output_path,
             ]
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -3086,6 +3154,7 @@ def _run_montage_background(
                     "-i", concat_file,
                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                     "-c:a", "aac",
+                    "-movflags", "+faststart",
                     output_path,
                 ]
                 proc2 = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=600)
@@ -3098,6 +3167,9 @@ def _run_montage_background(
             except OSError:
                 pass
 
+        # Generate thumbnail from the final montage
+        thumb_path = _generate_thumbnail(output_path, job_id, final_clip_id, seek_time=1.0)
+
         job_store.update(job_id, status="uploading", progress=85)
 
         # Step 4: Upload to R2
@@ -3109,6 +3181,9 @@ def _run_montage_background(
                 f, bucket, r2_key,
                 ExtraArgs={"ContentType": "video/mp4"},
             )
+
+        # Upload thumbnail
+        thumb_url = _upload_thumbnail(thumb_path, r2_client, bucket, job_id, final_clip_id)
 
         try:
             os.remove(output_path)
@@ -3127,6 +3202,7 @@ def _run_montage_background(
             "clipId": final_clip_id,
             "r2Key": r2_key,
             "publicUrl": presigned_url,
+            "thumbnailUrl": thumb_url,
             "title": title or "AI Montage",
             "segmentCount": n_segs,
             "segmentOrder": ordered_indices,
