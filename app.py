@@ -270,7 +270,7 @@ def download_source(url: str, job_id: str) -> Dict[str, Any]:
         "--retries", "3",
         "--fragment-retries", "3",
         # Anti-bot workarounds for YouTube
-        "--extractor-args", "youtube:player_client=android,web",
+        "--extractor-args", "youtube:player_client=android,ios,web_safari,web",
         "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         url,
     ]
@@ -345,7 +345,7 @@ def download_audio_only(url: str, job_id: str) -> Dict[str, Any]:
         "--retries", "3",
         "--fragment-retries", "3",
         # Anti-bot workarounds for YouTube
-        "--extractor-args", "youtube:player_client=android,web",
+        "--extractor-args", "youtube:player_client=android,ios,web_safari,web",
         "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         url,
     ]
