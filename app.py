@@ -2093,6 +2093,7 @@ def process_single_clip(
         "-t", str(duration),
         "-filter_complex", filter_str,
         "-map", "[out]",
+        "-map", "0:a?",
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "28",
