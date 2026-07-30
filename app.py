@@ -879,6 +879,24 @@ def download_clip_segment(url: str, job_id: str, start_time: float, end_time: fl
     cache_dir.mkdir(parents=True, exist_ok=True)
     output_path = str(cache_dir / "clip_source.mp4")
 
+    # Twitch clips are already short (30-60s) — download the whole thing
+    # instead of trying to download a segment (which fails for clips).
+    if source_type == "twitch_clip":
+        print("[download] Twitch clip detected — downloading full clip")
+        result = download_source(url, job_id)
+        # Move/rename the downloaded file to clip_source.mp4
+        downloaded = result["videoPath"]
+        if downloaded != output_path:
+            import shutil
+            shutil.move(downloaded, output_path)
+        return {
+            "videoPath": output_path,
+            "duration": result["duration"],
+            "sourceType": source_type,
+            "sizeBytes": result["sizeBytes"],
+            "segmentOffset": 0.0,
+        }
+
     pad = 3.0
     dl_start = max(0.0, start_time - pad)
     dl_end = end_time + pad
@@ -945,16 +963,27 @@ def _download_clip_segment_ffmpeg(url: str, job_id: str, dl_start: float, durati
     if ytdlp_result.returncode != 0:
         raise RuntimeError(f"yt-dlp URL fetch failed: {ytdlp_result.stderr[-2000:]}")
     stream_urls = [u.strip() for u in ytdlp_result.stdout.strip().split("\n") if u.strip()]
-    if len(stream_urls) < 2:
+    if len(stream_urls) == 0:
         raise RuntimeError("yt-dlp returned no stream URLs")
 
-    ffmpeg_cmd = [
-        "ffmpeg", "-y", "-ss", str(dl_start),
-        "-i", stream_urls[0], "-i", stream_urls[1],
-        "-t", str(duration), "-c", "copy",
-        "-movflags", "+faststart",
-        output_path,
-    ]
+    # Twitch clips and some sources return a single muxed stream URL
+    # (video+audio combined). Handle both single and dual stream cases.
+    if len(stream_urls) == 1:
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-ss", str(dl_start),
+            "-i", stream_urls[0],
+            "-t", str(duration), "-c", "copy",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+    else:
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-ss", str(dl_start),
+            "-i", stream_urls[0], "-i", stream_urls[1],
+            "-t", str(duration), "-c", "copy",
+            "-movflags", "+faststart",
+            output_path,
+        ]
     result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg segment download failed: {result.stderr[-3000:]}")
