@@ -1883,7 +1883,6 @@ def _generate_clip_srt(
 
                 # Slide in from bottom (12px offset -> 0)
                 slide_px = 12
-                tags.append(f"\\pos(0,{slide_px})")
 
                 # Animate to active state at word_start_ms
                 if word_start_ms > 0:
@@ -1891,7 +1890,7 @@ def _generate_clip_srt(
                 # Pop in at word start
                 tags.append(
                     f"\\t({word_start_ms},{word_start_ms + int(pop_in_ms)},"
-                    f"\\alpha&H00&\\c{word_color}\\fscx{active_scale}\\fscy{active_scale}\\pos(0,0))"
+                    f"\\alpha&H00&\\c{word_color}\\fscx{active_scale}\\fscy{active_scale})"
                 )
                 # Settle slightly after pop
                 settle_scale = max(95, active_scale - 8)
