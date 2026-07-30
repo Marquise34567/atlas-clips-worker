@@ -96,6 +96,9 @@ def _detect_source_type(url: str) -> Optional[str]:
         return None
     if _re.match(r"^(https?://)?(www\.)?(twitch\.tv/videos/\d+)", trimmed, _re.I):
         return "twitch"
+    # Twitch clip: twitch.tv/<channel>/clip/<id> or clips.twitch.tv/<id>
+    if _re.match(r"^(https?://)?(www\.)?(twitch\.tv/[\w-]+/clip/[\w-]+|clips\.twitch\.tv/[\w-]+)", trimmed, _re.I):
+        return "twitch_clip"
     if _re.match(r"^(https?://)?(www\.)?(youtube\.com/(watch\?v=|shorts/|live/|embed/)|youtu\.be/)[\w-]{6,}", trimmed, _re.I):
         return "youtube"
     return None
