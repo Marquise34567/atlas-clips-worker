@@ -1559,6 +1559,128 @@ def _caption_force_style(style_name: str) -> str:
     return ",".join(parts)
 
 
+def _build_manual_crop_filter(
+    W: int,
+    H: int,
+    has_webcam: bool,
+    manual_webcam_crop: Optional[Dict],
+    manual_background_crop: Optional[Dict],
+    manual_webcam_shape: str = "circle",
+    manual_webcam_scale: float = 1.0,
+    manual_webcam_output_position: str = "top-right",
+    enable_captions: bool = False,
+    srt_path: str = "",
+    caption_style: str = "white",
+) -> str:
+    """Build ffmpeg filter for manual crop mode.
+
+    manual_webcam_crop / manual_background_crop are dicts with x, y, width, height
+    as fractions (0-1) of the source video dimensions.
+    """
+    import math
+
+    # We need source dimensions — use ffprobe at call site is too late,
+    # so we use crop with fraction-based expressions via iw/ih.
+    # ffmpeg crop filter accepts expressions with iw, ih (input width/height).
+
+    filters = []
+
+    # ─── Background: crop the user-selected region, scale to fill 9:16 ───
+    if manual_background_crop:
+        bx = manual_background_crop.get("x", 0)
+        by = manual_background_crop.get("y", 0)
+        bw = manual_background_crop.get("width", 1)
+        bh = manual_background_crop.get("height", 1)
+        # crop=x_offset:y_offset:width:height (all as fractions of input)
+        # ffmpeg crop filter: crop=iw*bw:ih*bh:iw*bx:ih*by
+        filters.append(
+            f"[0:v]crop=iw*{bw}:ih*{bh}:iw*{bx}:ih*{by},"
+            f"scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H}[bg]"
+        )
+    else:
+        # No manual background crop — scale full source to 9:16
+        filters.append(
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H}[bg]"
+        )
+
+    # ─── Webcam: crop the user-selected region, make it a PIP overlay ───
+    if has_webcam and manual_webcam_crop:
+        wx = manual_webcam_crop.get("x", 0.72)
+        wy = manual_webcam_crop.get("y", 0.02)
+        ww = manual_webcam_crop.get("width", 0.26)
+        wh = manual_webcam_crop.get("height", 0.23)
+
+        # PIP size: 25% of output width, scaled by user factor
+        pip_w = int(W * 0.25 * manual_webcam_scale)
+        pip_h = pip_w  # square (aspect locked in UI)
+
+        # Crop webcam region from source, scale to PIP size
+        filters.append(
+            f"[0:v]crop=iw*{ww}:ih*{wh}:iw*{wx}:ih*{wy},"
+            f"scale={pip_w}:{pip_h}:force_original_aspect_ratio=increase,"
+            f"crop={pip_w}:{pip_h}"
+        )
+
+        # Apply shape mask
+        if manual_webcam_shape == "circle":
+            # Circle mask using geq
+            r = pip_w // 2
+            filters.append(
+                f"geq=lum='p(X,Y)':a='if(lt(hypot(X-{r},Y-{r}),{r}),255,0)'[webcam]"
+            )
+        elif manual_webcam_shape == "rounded":
+            # Rounded corners using a pre-alpha overlay approach
+            corner_r = min(pip_w // 5, 20)
+            filters.append(
+                f"geq=lum='p(X,Y)':a='if(between(X,{corner_r},{pip_w}-{corner_r}),255,"
+                f"if(between(Y,{corner_r},{pip_h}-{corner_r}),255,"
+                f"if(lt(hypot(X-{corner_r},Y-{corner_r}),{corner_r}),255,"
+                f"if(lt(hypot(X-({pip_w}-{corner_r}),Y-{corner_r}),{corner_r}),255,"
+                f"if(lt(hypot(X-{corner_r},Y-({pip_h}-{corner_r})),{corner_r}),255,"
+                f"if(lt(hypot(X-({pip_w}-{corner_r}),Y-({pip_h}-{corner_r})),{corner_r}),255,0))))))'[webcam]"
+            )
+        else:
+            # Square — just label it
+            filters.append(f"format=rgba[webcam]")
+
+        # ─── Overlay webcam PIP onto background ───
+        # Position mapping (with margin)
+        margin = int(W * 0.04)
+        pos_map = {
+            "top-left":     (margin, margin),
+            "top-right":    (W - pip_w - margin, margin),
+            "bottom-left":  (margin, H - pip_h - margin),
+            "bottom-right": (W - pip_w - margin, H - pip_h - margin),
+            "center":       ((W - pip_w) // 2, (H - pip_h) // 2),
+        }
+        ox, oy = pos_map.get(manual_webcam_output_position, pos_map["top-right"])
+
+        if enable_captions and srt_path:
+            # Burn captions then overlay webcam
+            filters.append(
+                f"[bg]subtitles='{srt_path}':force_style='{_caption_force_style(caption_style)}'[bgcap]"
+            )
+            filters.append(
+                f"[bgcap][webcam]overlay={ox}:{oy}[out]"
+            )
+        else:
+            filters.append(
+                f"[bg][webcam]overlay={ox}:{oy}[out]"
+            )
+    else:
+        # No webcam PIP — just background (with optional captions)
+        if enable_captions and srt_path:
+            filters.append(
+                f"[bg]subtitles='{srt_path}':force_style='{_caption_force_style(caption_style)}'[out]"
+            )
+        else:
+            filters.append("[bg]copy[out]")
+
+    return ";".join(filters)
+
+
 def _build_reframe_filter(
     has_webcam: bool,
     webcam_position: str = "top",
@@ -1567,6 +1689,11 @@ def _build_reframe_filter(
     srt_path: str = "",
     caption_style: str = "white",
     webcam_bbox: Optional[tuple] = None,
+    manual_webcam_crop: Optional[Dict] = None,
+    manual_background_crop: Optional[Dict] = None,
+    manual_webcam_shape: str = "circle",
+    manual_webcam_scale: float = 1.0,
+    manual_webcam_output_position: str = "top-right",
 ) -> str:
     """Build the ffmpeg filter_complex string for vertical 9:16 reframing.
 
@@ -1582,6 +1709,23 @@ def _build_reframe_filter(
 
     W, H = 720, 1280
     half_h = H // 2  # 640
+
+    # ─── Manual crop mode: user drew webcam + background regions ───
+    # When manual crop is provided, we use exact pixel regions instead
+    # of the auto-detect / preset position logic.
+    if manual_webcam_crop or manual_background_crop:
+        return _build_manual_crop_filter(
+            W=W, H=H,
+            has_webcam=has_webcam,
+            manual_webcam_crop=manual_webcam_crop,
+            manual_background_crop=manual_background_crop,
+            manual_webcam_shape=manual_webcam_shape,
+            manual_webcam_scale=manual_webcam_scale,
+            manual_webcam_output_position=manual_webcam_output_position,
+            enable_captions=enable_captions,
+            srt_path=srt_path,
+            caption_style=caption_style,
+        )
 
     if has_webcam:
         webcam_on_top = webcam_position not in ("bottom", "bottom-left", "bottom-right")
@@ -1996,6 +2140,11 @@ def process_single_clip(
     transcript_segments: Optional[List[Dict[str, Any]]] = None,
     segment_offset: float = 0.0,
     webcam_corner: Optional[str] = None,
+    manual_webcam_crop: Optional[Dict] = None,
+    manual_background_crop: Optional[Dict] = None,
+    manual_webcam_shape: str = "circle",
+    manual_webcam_scale: float = 1.0,
+    manual_webcam_output_position: str = "top-right",
 ) -> Dict[str, Any]:
     """Cut, reframe, and encode a single clip. Uploads to R2.
 
@@ -2083,6 +2232,11 @@ def process_single_clip(
         srt_path=srt_path,
         caption_style=caption_style,
         webcam_bbox=webcam_bbox,
+        manual_webcam_crop=manual_webcam_crop,
+        manual_background_crop=manual_background_crop,
+        manual_webcam_shape=manual_webcam_shape,
+        manual_webcam_scale=manual_webcam_scale,
+        manual_webcam_output_position=manual_webcam_output_position,
     )
 
     cmd = [
@@ -2686,6 +2840,11 @@ def _run_single_clip_background(
             transcript_segments=transcript_segments,
             segment_offset=segment_offset,
             webcam_corner=webcam_corner,
+            manual_webcam_crop=rc.get("manualWebcamCrop"),
+            manual_background_crop=rc.get("manualBackgroundCrop"),
+            manual_webcam_shape=rc.get("manualWebcamShape", "circle"),
+            manual_webcam_scale=rc.get("manualWebcamScale", 1.0),
+            manual_webcam_output_position=rc.get("manualWebcamOutputPosition", "top-right"),
         )
 
         # Clean up downloaded segment
